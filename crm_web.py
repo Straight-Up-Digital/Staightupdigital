@@ -66,7 +66,7 @@ def safe_url(value) -> str:
     if not v or re.search(r"\s", v):
         return ""
     if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", v):
-        if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", v) and not re.match(r"^[^/]+\.[a-zA-Z]{2,}(:\d+)?(/|$)", v):
+        if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", v) and not re.match(r"^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(:\d+)?(/|$)", v):
             return ""
         v = "https://" + v
     try:

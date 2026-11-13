@@ -751,8 +751,12 @@ def search_research(business_name: str, location: str, industry: str, website_do
     suffix = f' "{location}"' if location else ""
     business_query = f'"{business_name}"{suffix}'
     google_query = f'"{business_name}"{suffix} Google Business Profile OR Google Maps OR Google reviews'
-    review_query = f'"{business_name}"{suffix} reviews OR HelloPeter OR Trustpilot'
-    competitor_query = f'{industry or business_name} {location} company'.strip()
+    profile = industry_profile(industry)
+    review_query = f'"{business_name}"{suffix} {profile["review_search"]}'
+    if profile["key"] == "accommodation":
+        competitor_query = f'{industry or "guest house"} {location} accommodation'.strip()
+    else:
+        competitor_query = f'{industry or business_name} {location} company'.strip()
     queries = {
         "business_discovery": business_query,
         "google_discovery": google_query,
@@ -777,7 +781,7 @@ def search_research(business_name: str, location: str, industry: str, website_do
         seen.add(url)
         if any(host in lower for host in ("google.com/maps", "maps.google.", "g.page/", "google.com/search")):
             google_candidates.append(item)
-        if any(host in lower for host in ("hellopeter.com", "trustpilot.com", "google.com/maps", "reviews.io")):
+        if any(host in lower for host in profile["review_hosts"]):
             reviews.append(item)
 
     comp_seen = set()
@@ -803,6 +807,83 @@ def search_research(business_name: str, location: str, industry: str, website_do
             "review count, rating, competitor relationship, or current business status."
         )
     }
+
+
+# ---------------------------------------------------------------- industry profiles
+# The audit was written around trades (plumbers, electricians). A guest house is not a plumber, so the
+# wording, keyword ideas, review platforms and page briefs switch to an accommodation profile when the
+# industry looks like accommodation. Everything else keeps the original trade wording.
+ACCOMMODATION_RE = re.compile(
+    r"\b(guest ?house|guest ?lodge|bed (and|&) breakfast|b ?& ?b|bnb|lodge|hotel|accommodation|self[- ]catering|"
+    r"backpackers?|holiday (home|rental|accommodation|cottage)|inn|resort|chalets?|lodging)\b", re.I)
+
+TRADE_PROFILE = {
+    "key": "trade",
+    "review_platforms": "HelloPeter and Trustpilot",
+    "review_search": "reviews OR HelloPeter OR Trustpilot",
+    "review_hosts": ("hellopeter.com", "trustpilot.com", "google.com/maps", "reviews.io"),
+    "service_hints": ("service", "product", "what-we-do", "solution", "offer", "gallery", "portfolio", "work"),
+    "hours_expected": True,
+    "service_terms": ("services", "products", "solutions", "we offer"),
+    "content_groups": {
+        "services/products": ("services", "products", "solutions", "what we do"),
+        "locations/service areas": ("service area", "areas we serve", "located in", "south africa"),
+        "portfolio/projects": ("portfolio", "our work", "projects", "gallery", "case study"),
+        "helpful content": ("blog", "articles", "guides", "faq", "how to"),
+        "customer proof": ("testimonials", "customer reviews", "client feedback"),
+    },
+}
+
+ACCOMMODATION_PROFILE = {
+    "key": "accommodation",
+    "review_platforms": "TripAdvisor, Booking.com and Airbnb",
+    "review_search": "reviews OR TripAdvisor OR Booking.com",
+    "review_hosts": ("tripadvisor.", "booking.com", "airbnb.", "lekkeslaap", "sa-venues.com", "hellopeter.com",
+                     "trustpilot.com", "google.com/maps", "reviews.io"),
+    "service_hints": ("room", "accommodation", "suite", "unit", "cottage", "chalet", "rates", "tariff", "stay",
+                      "self-catering", "selfcatering", "apartment", "villa"),
+    "hours_expected": False,
+    "service_terms": ("rooms", "accommodation", "we offer", "bed and breakfast", "self-catering", "suites", "stay"),
+    "content_groups": {
+        "rooms and rates": ("rooms", "accommodation", "suites", "rates", "tariff", "per night", "self-catering"),
+        "how to book": ("book now", "book online", "booking", "availability", "reserve", "reservation", "enquire"),
+        "local area and directions": ("attractions", "things to do", "directions", "how to find us", "the area", "located in"),
+        "photo gallery": ("gallery", "photos"),
+        "guest proof": ("guest reviews", "reviews", "testimonials", "guest book", "tripadvisor", "rated"),
+        "helpful content": ("blog", "articles", "guides", "faq", "frequently asked", "check-in", "check in"),
+    },
+}
+
+BOOKING_WORDS = ("book now", "book online", "booking", "availability", "reserve", "reservation", "per night",
+                 "per person", "rates", "tariff", "check availability")
+
+REVIEW_BLURB_RE = re.compile(
+    r"\b(rated|ratings?|reviews?|testimonials?|stars?|award[- ]winning|guests say|what (our )?(guests|clients|customers))\b", re.I)
+PHOTO_CAPTION_RE = re.compile(r"(\b(photos?|pictures?|images?)\s*$)|(^(photos?|pictures?|images?)\s+of\b)|\bphoto gallery\b", re.I)
+
+
+def industry_profile(industry: str) -> dict:
+    return ACCOMMODATION_PROFILE if ACCOMMODATION_RE.search(clean_text(industry)) else TRADE_PROFILE
+
+
+def site_display_name(research: dict) -> str:
+    """The name the website uses for itself (site name, else the first part of the title)."""
+    for page in research.get("pages", []):
+        name = clean_text(page.get("site_name"))
+        if 1 < len(name) <= 60:
+            return name
+    for page in research.get("pages", []):
+        title = clean_text(page.get("title"))
+        if title:
+            first = re.split(r"\s+[|:]\s+|\s+[-\u2013\u2014]\s+|,\s+", title)[0].strip()
+            if first.lower() not in {"home", "homepage", "welcome", "index"} and 1 < len(first) <= 60:
+                return first
+    return ""
+
+
+def has_booking_signal(research: dict) -> bool:
+    text = clean_text(research.get("combined_text", "")).lower()
+    return any(w in text for w in BOOKING_WORDS)
 
 
 def extract_keywords(research: dict, business_name: str, location: str, industry: str) -> dict:
@@ -845,16 +926,26 @@ def extract_keywords(research: dict, business_name: str, location: str, industry
     town = clean_text(location).split(",")[0].strip()
     industry_seed = clean_text(industry).lower()
     long_tail = []
+    accommodation = industry_profile(industry)["key"] == "accommodation"
     for seed in seeds[:3]:
         if seed.lower() == industry_seed:
-            for suffix in ("services", "company", "near me", "cost", "prices", "supplier", "installation"):
-                long_tail.append(f"{seed} {suffix}")
-            if town:
-                for suffix in ("", "services", "company", "prices", "supplier"):
-                    long_tail.append(clean_text(f"{seed} {town} {suffix}"))
-                long_tail.append(f"{seed} near {town}")
+            if accommodation:
+                for suffix in ("rates", "rooms", "bed and breakfast", "book direct", "near me", "reviews"):
+                    long_tail.append(f"{seed} {suffix}")
+                if town:
+                    for suffix in ("", "rates", "accommodation", "bed and breakfast", "reviews"):
+                        long_tail.append(clean_text(f"{seed} {town} {suffix}"))
+                    long_tail += [f"{seed} in {town}", f"{town} accommodation", f"where to stay in {town}"]
+            else:
+                for suffix in ("services", "company", "near me", "cost", "prices", "supplier", "installation"):
+                    long_tail.append(f"{seed} {suffix}")
+                if town:
+                    for suffix in ("", "services", "company", "prices", "supplier"):
+                        long_tail.append(clean_text(f"{seed} {town} {suffix}"))
+                    long_tail.append(f"{seed} near {town}")
         else:
-            for suffix in ("reviews", "contact details", "prices", "quote"):
+            suffixes = ("reviews", "contact details", "rates", "book") if accommodation else ("reviews", "contact details", "prices", "quote")
+            for suffix in suffixes:
                 long_tail.append(f"{seed} {suffix}")
     return {
         "recurring_terms_in_titles_meta_headings": recurring,
@@ -1036,7 +1127,8 @@ def _serpapi_raw(business_name: str, town: str, website_domain: str) -> dict:
         "maps_url": f"https://www.google.com/maps/place/?q=place_id:{pid}" if pid else "",
         "rating": c.get("rating"), "review_count": reviews,
         "website": c.get("website", ""), "phone": c.get("phone", ""),
-        "has_hours": bool(c.get("operating_hours") or c.get("hours")),
+        "has_hours": (True if (c.get("operating_hours") or c.get("hours") or c.get("open_state"))
+                      else (False if c is data.get("place_results") else None)),  # None = this result does not say
         "photo_count": None,  # not returned by the search call
         "primary_type": category, "category": category,
         "business_status": "CLOSED_PERMANENTLY" if closed else "OPERATIONAL",
@@ -1077,12 +1169,12 @@ def serpapi_google_listing(business_name: str, town: str, website_domain: str) -
     return result
 
 
-def score_google_profile(g: dict) -> int:
+def score_google_profile(g: dict, hours_expected: bool = True) -> int:
     pts, top = 8, 8                       # confirmed listing
     if g.get("phone") is not None:        # None means unknown, so it is left out of the score
         pts += 2 if g.get("phone") else 0
         top += 2
-    if g.get("has_hours") is not None:
+    if hours_expected and g.get("has_hours") is not None:
         pts += 3 if g.get("has_hours") else 0
         top += 3
     pts += 1 if g.get("business_status") == "OPERATIONAL" else 0
@@ -1110,7 +1202,8 @@ def score_reputation(g: dict) -> int:
     return min(15, round(pts / top * 15))
 
 
-def score_presence(research: dict, places: dict | None = None) -> dict:
+def score_presence(research: dict, places: dict | None = None, industry: str = "") -> dict:
+    profile = industry_profile(industry)
     pages = research.get("pages", [])
     successful = [p for p in pages if p.get("success", True)]
     text = clean_text(research.get("combined_text", "")).lower()
@@ -1143,25 +1236,19 @@ def score_presence(research: dict, places: dict | None = None) -> dict:
     website = round(min(20, (4 if page_count >= 5 else 2 if page_count >= 2 else 1 if page_count else 0)
                         + 3 * title_r + 3 * desc_r + 3 * h1_r + 3 * alt_r
                         + (4 if any(x in text for x in ("contact", "phone", "email", "quote")) else 0)))
-    content_groups = {
-        "services/products": ("services", "products", "solutions", "what we do"),
-        "locations/service areas": ("service area", "areas we serve", "located in", "south africa"),
-        "portfolio/projects": ("portfolio", "our work", "projects", "gallery", "case study"),
-        "helpful content": ("blog", "articles", "guides", "faq", "how to"),
-        "customer proof": ("testimonials", "customer reviews", "client feedback")
-    }
+    content_groups = profile["content_groups"]
     found_groups = [name for name, keys in content_groups.items() if any(k in text for k in keys)]
     content = min(15, (5 if page_count >= 5 else 3 if page_count >= 3 else 1 if page_count else 0)
                   + min(10, len(found_groups) * 2))
     social_count = len(socials)
     social = min(15, social_count * 3)
     brand = min(15, (3 if titles else 0)
-                + (4 if any(x in text for x in ("services", "products", "solutions", "we offer")) else 0)
+                + (4 if any(x in text for x in profile["service_terms"]) else 0)
                 + (4 if any(x in text for x in ("contact", "phone", "email", "address")) else 0)
                 + (4 if any(x in text for x in ("about us", "our story", "established", "since ")) else 0))
 
     g = places if places and places.get("matched") else None
-    google_score = score_google_profile(g) if g else None
+    google_score = score_google_profile(g, profile["hours_expected"]) if g else None
     rep_score = score_reputation(g) if g else None
     scored_points = website + content + social + brand + (google_score or 0) + (rep_score or 0)
     assessed_max = 65 + (35 if g else 0)
@@ -1173,7 +1260,7 @@ def score_presence(research: dict, places: dict | None = None) -> dict:
             {"category": "Linked social profiles", "score": social, "out_of": 15, "status": "assessed"},
             {"category": "Content coverage", "score": content, "out_of": 15, "status": "assessed"},
             {"category": "Independent reputation", "score": rep_score, "out_of": 15,
-             "status": "assessed from Google reviews only (HelloPeter/Trustpilot not included)" if g else "not verified (no API key or no confident match)"},
+             "status": f"assessed from Google reviews only ({profile['review_platforms']} not included)" if g else "not verified (no API key or no confident match)"},
             {"category": "Business identity clarity", "score": brand, "out_of": 15, "status": "assessed"}
         ],
         "assessed_score": round(scored_points / assessed_max * 100) if assessed_max else None,
@@ -1196,6 +1283,27 @@ def build_opportunities(research: dict, score: dict, external: dict, keywords: d
     social_score = categories["Linked social profiles"]["score"]
     brand_score = categories["Business identity clarity"]["score"]
     pages = research.get("pages", [])
+    profile = industry_profile(external.get("industry_used_for_search", ""))
+    successful = [p for p in pages if p.get("success", True)]
+    insecure = [p for p in successful if (p.get("technical") or {}).get("https") is False]
+    if successful and len(insecure) / len(successful) >= 0.5:
+        opportunities.append({
+            "priority": "High", "title": "Move the website to HTTPS",
+            "evidence": (f"{len(insecure)} of {len(successful)} crawled pages were served over plain http:// and the crawl never ended "
+                         "on an https:// address. Browsers can show a 'Not secure' warning on such sites, which puts visitors off "
+                         "before they enquire or book."),
+            "action": ("Ask the host whether a free SSL certificate is available, install it, then redirect every http:// address to "
+                       "its https:// version and update the Google listing and social links to the https:// address."),
+            "service_fit": "Website security and hosting"
+        })
+    if profile["key"] == "accommodation" and successful and not has_booking_signal(research):
+        opportunities.append({
+            "priority": "High", "title": "Make rates and booking easy to find",
+            "evidence": "No booking, availability or rates wording was found on the crawled pages.",
+            "action": ("Show what each room costs and what is included, and give a clear way to check availability or enquire "
+                       "(phone, WhatsApp or a short enquiry form) from every page."),
+            "service_fit": "Website conversion review"
+        })
 
     if website_score < 14:
         opportunities.append({
@@ -1207,10 +1315,12 @@ def build_opportunities(research: dict, score: dict, external: dict, keywords: d
     op = score.get("onpage_stats") or {}
     n_pages = op.get("pages", 0)
     if n_pages:
-        h1_bad = op["pages_without_h1"] / n_pages >= 0.5
-        alt_bad = op["images"] > 0 and op["images_missing_alt"] / op["images"] >= 0.5
+        h1_ratio = op["pages_without_h1"] / n_pages
+        alt_ratio = op["images_missing_alt"] / op["images"] if op["images"] else 0
         weak_pages = op["pages_without_meta_description"] + op["weak_meta_descriptions"]
-        meta_bad = weak_pages / n_pages >= 0.5
+        meta_ratio = weak_pages / n_pages
+        h1_bad, alt_bad, meta_bad = h1_ratio >= 0.25, alt_ratio >= 0.25, meta_ratio >= 0.5
+        severe = sum([h1_ratio >= 0.5, alt_ratio >= 0.5, meta_ratio >= 0.5])
         if h1_bad or alt_bad or meta_bad:
             parts = []
             if h1_bad:
@@ -1220,7 +1330,7 @@ def build_opportunities(research: dict, score: dict, external: dict, keywords: d
             if meta_bad:
                 parts.append(f"{weak_pages} of {n_pages} pages have a missing or weak meta description (too short, too long, or auto-generated text)")
             opportunities.append({
-                "priority": "High" if sum([h1_bad, alt_bad, meta_bad]) >= 2 else "Medium",
+                "priority": "High" if severe >= 2 else "Medium",
                 "title": "Fix on-page SEO basics",
                 "evidence": "; ".join(parts) + ".",
                 "action": "Give every key page one clear H1 that names the service and town, write a unique 120 to 155 character meta description for each, and add descriptive alt text to project and product images.",
@@ -1246,7 +1356,7 @@ def build_opportunities(research: dict, score: dict, external: dict, keywords: d
     if g.get("matched"):
         gscore = categories["Google Business Profile"]["score"]
         gaps = []
-        if g.get("has_hours") is False:
+        if g.get("has_hours") is False and profile["hours_expected"]:
             gaps.append("opening hours")
         if g.get("phone") == "":
             gaps.append("phone number")
@@ -1279,11 +1389,11 @@ def build_opportunities(research: dict, score: dict, external: dict, keywords: d
         age = g.get("latest_review_age_days")
         review_evidence = (f"Google shows {g.get('rating')} from {g.get('review_count')} reviews"
                            + (f"; newest sampled review about {age} days old" if age is not None else "")
-                           + ". HelloPeter and Trustpilot still need a manual check.")
+                           + f". {profile['review_platforms']} still need a manual check.")
     opportunities.append({
         "priority": "Medium", "title": "Verify public reviews and trust signals",
         "evidence": review_evidence,
-        "action": "Check the exact business identity on Google, HelloPeter, Trustpilot and industry-specific platforms. Record rating, review count, latest review date and response patterns only after direct verification.",
+        "action": f"Check the exact business identity on Google, {profile['review_platforms']} and industry-specific platforms. Record rating, review count, latest review date and response patterns only after direct verification.",
         "service_fit": "Reputation monitoring"
     })
     if brand_score < 11:
@@ -1293,6 +1403,18 @@ def build_opportunities(research: dict, score: dict, external: dict, keywords: d
             "action": "State who the business serves, what it provides, where it operates, and how to request a quote. Use verifiable proof rather than unsupported claims.",
             "service_fit": "Website copy improvement"
         })
+    listed_name = clean_text(g.get("name")) if g.get("matched") else ""
+    own_name = site_display_name(research)
+    if listed_name and own_name:
+        a, b = norm_name(listed_name), norm_name(own_name)
+        if a and b and a != b and a not in b and b not in a:
+            opportunities.append({
+                "priority": "Medium", "title": "Use one consistent business name",
+                "evidence": f"The Google listing is named '{listed_name}' but the website calls the business '{own_name}'.",
+                "action": ("Choose one trading name and use it on the website title, the Google listing, social profiles and any "
+                           "schema markup, so search engines and customers recognise a single business."),
+                "service_fit": "Local SEO setup"
+            })
     ld = (research.get("google_signals") or {}).get("structured_data_types", [])
     if not any(t.lower() in ("localbusiness", "organization", "corporation")
                or t.lower().endswith("business") or t.lower().endswith("store") for t in ld):
@@ -1308,7 +1430,7 @@ def build_opportunities(research: dict, score: dict, external: dict, keywords: d
         "action": "Choose 5 to 10 relevant seed terms, validate them with Google Search Console or a keyword data provider, then map each priority term to a useful page and measure impressions, clicks and enquiries.",
         "service_fit": "SEO keyword research"
     })
-    return opportunities[:8]
+    return opportunities[:12]
 
 
 def infer_business_name(research: dict, url: str) -> str:
@@ -1641,8 +1763,9 @@ def question_headings(pages: list) -> list:
     return found
 
 
-def detect_services(research: dict, business_name: str) -> list:
+def detect_services(research: dict, business_name: str, industry: str = "") -> list:
     found = []
+    hints = industry_profile(industry)["service_hints"]
 
     def add(text, source):
         t = clean_text(text).strip(" :-|")
@@ -1653,18 +1776,20 @@ def detect_services(research: dict, business_name: str) -> list:
             return
         if norm_name(t) == norm_name(business_name):
             return
+        if REVIEW_BLURB_RE.search(t) or PHOTO_CAPTION_RE.search(t):
+            return
         if low not in [x[0].lower() for x in found]:
             found.append((t, source))
 
     pages = research.get("pages", [])
     for p in pages:
         path = urlparse(p["url"]).path.lower()
-        if any(h in path for h in SERVICE_HINTS):
+        if any(h in path for h in hints):
             for h in p.get("headings", []):
                 add(h, p["url"])
     if pages:
         for l in pages[0].get("links", []):
-            if l.get("internal") and any(h in l["url"].lower() for h in SERVICE_HINTS):
+            if l.get("internal") and any(h in l["url"].lower() for h in hints):
                 add(l.get("text", ""), l["url"])
     return found[:14]
 
@@ -1836,8 +1961,113 @@ def ai_readiness(research: dict, extras: dict, pages: list) -> list:
     return checks
 
 
+def build_accommodation_briefs(business_name: str, town: str, matrix: list, gaps: dict,
+                              research: dict, external: dict) -> list:
+    """Content briefs written for guest houses and other accommodation (rooms, rates, booking, local area)."""
+    g = external.get("google_places") or {}
+    pages = research.get("pages", [])
+    proof = []
+    if g.get("matched") and g.get("rating"):
+        proof.append(f"Google rating of {g['rating']} from {g.get('review_count')} reviews (quote it only if current)")
+    proof += ["Real, recent photos of each room with descriptive alt text",
+              "Guest reviews, used with the guest's permission",
+              "Address, phone and check-in details, so the property is clearly real"]
+    pool = gaps.get("competitor_questions") or []
+    where = town or "the area"
+    home = pages[0]["url"] if pages else ""
+    briefs = []
+
+    for m in [x for x in matrix if not x["dedicated_page"]][:2]:
+        room = m["service"]
+        links = ["Home page and main menu to this page"]
+        if m.get("listed_on") and m["listed_on"] != home:
+            links.append(f"{m['listed_on']} (where it is only listed today), using the anchor text '{room.lower()}'")
+        links.append("Contact and booking enquiry pages")
+        briefs.append({
+            "page_type": "Room or unit page",
+            "working_title": clean_text(f"{room} | {business_name}, {town}") if town else clean_text(f"{room} | {business_name}"),
+            "target_phrase": clean_text(f"{room} {town}").lower(),
+            "intent": "Commercial and local: the visitor is choosing where to stay and wants rates and availability.",
+            "why": f"'{room}' is listed on the site but has no page of its own, so it cannot be found or shared on its own.",
+            "h1": clean_text(f"{room} in {town}") if town else room,
+            "outline": [f"What the {room.lower()} offers and who it suits", "Bed set-up, bathroom and facilities",
+                        "Rates by season and what is included", "Real photos", "How to check availability or book",
+                        f"Nearby things to do around {where}", "FAQs"],
+            "questions_to_answer": [f"How much is the {room.lower()} per night?", "What is included in the rate?",
+                                    f"Can I book the {room.lower()} directly?"],
+            "internal_links": links, "proof_to_include": proof,
+            "schema": ["LodgingBusiness", "Offer"],
+            "suggested_length": "Long enough to answer the questions properly. Do not pad."})
+
+    has_rooms = any(any(k in urlparse(p["url"]).path.lower() for k in ("room", "accommodation", "rates", "tariff", "suite", "unit"))
+                    for p in pages)
+    if not has_rooms:
+        briefs.append({
+            "page_type": "Rooms and rates page",
+            "working_title": clean_text(f"Rooms and rates | {business_name}, {town}") if town else f"Rooms and rates | {business_name}",
+            "target_phrase": clean_text(f"accommodation {town}").lower(),
+            "intent": "Commercial and local: the visitor is comparing places to stay.",
+            "why": "No page for rooms or rates was found in the crawl.",
+            "h1": clean_text(f"Rooms and rates in {town}") if town else "Rooms and rates",
+            "outline": ["Each room type with a short description", "Rates by season and what is included",
+                        "Check-in and check-out times", "How to check availability or book"],
+            "questions_to_answer": ["How much is a room per night?", "Is breakfast included?", "How do I book?"],
+            "internal_links": ["Main menu and home page", "Contact and booking enquiry pages"],
+            "proof_to_include": proof, "schema": ["LodgingBusiness", "Offer"],
+            "suggested_length": "As long as the rooms need. Keep rates easy to scan."})
+
+    if not has_booking_signal(research):
+        briefs.append({
+            "page_type": "Booking and enquiry path",
+            "working_title": f"Check availability | {business_name}",
+            "target_phrase": clean_text(f"book accommodation {town}").lower(),
+            "intent": "Transactional: the visitor is ready to ask about dates.",
+            "why": "No booking, availability or rates wording was found, so interested visitors have no clear next step.",
+            "h1": "Check availability and book",
+            "outline": ["Phone, WhatsApp and email options", "Short enquiry form (dates, guests, room)",
+                        "What happens after an enquiry and how fast you reply", "Deposit and cancellation terms in plain language"],
+            "questions_to_answer": ["How do I reserve a room?", "Is a deposit required?", "What is the cancellation policy?"],
+            "internal_links": ["A booking button on every page and on each room page"],
+            "proof_to_include": proof[:2], "schema": ["LodgingBusiness", "ContactPoint"],
+            "suggested_length": "Short and clear."})
+
+    has_area = any(any(k in urlparse(p["url"]).path.lower() for k in ("area", "attraction", "things-to-do", "explore", "around", "activities"))
+                   for p in pages)
+    if not has_area:
+        briefs.append({
+            "page_type": "Local area guide",
+            "working_title": clean_text(f"Things to do in {town} | {business_name}") if town else f"Things to do nearby | {business_name}",
+            "target_phrase": clean_text(f"things to do in {town}").lower(),
+            "intent": "Informational: visitors planning a trip who may not have chosen where to stay yet.",
+            "why": "No page about the surrounding area was found. Area guides bring in people who are still planning.",
+            "h1": clean_text(f"Things to do in {town}") if town else "Things to do nearby",
+            "outline": ["Top attractions and activities, with distances", "Eating out and local services", "Getting here and around",
+                        "Seasonal tips"],
+            "questions_to_answer": pool[:3] or [f"What is there to do in {where}?", f"How far is {business_name} from the main attractions?"],
+            "internal_links": ["Link to the rooms page and to booking from each section"],
+            "proof_to_include": ["Only recommend places you can vouch for", "Real photos you took"],
+            "schema": ["Article", "LodgingBusiness"], "suggested_length": "A useful guide, not a list of links."})
+
+    if gaps.get("own_question_headings", 0) < 3:
+        briefs.append({
+            "page_type": "FAQ section on key pages", "working_title": f"FAQs for {business_name}",
+            "target_phrase": "guest questions", "intent": "Informational: guests checking details before they book.",
+            "why": "The site answers very few direct guest questions, which also limits visibility in AI answers.",
+            "h1": "Frequently asked questions",
+            "outline": ["Check-in and check-out", "Breakfast and meals", "Parking and access", "Children, pets and groups",
+                        "Payment, deposits and cancellations"],
+            "questions_to_answer": ["What time is check-in and check-out?", "Is breakfast included?", "Is there secure parking?",
+                                    "Do you accept children or pets?", f"How far are you from the centre of {where}?"],
+            "internal_links": ["Add the relevant questions to each room page and link to the full FAQ"],
+            "proof_to_include": proof[:2], "schema": ["FAQPage"],
+            "suggested_length": "Short, direct answers in the guest's own wording."})
+    return briefs[:5]
+
+
 def build_briefs(business_name: str, town: str, matrix: list, loc: list, gaps: dict,
-                 research: dict, external: dict) -> list:
+                 research: dict, external: dict, industry: str = "") -> list:
+    if industry_profile(industry)["key"] == "accommodation":
+        return build_accommodation_briefs(business_name, town, matrix, gaps, research, external)
     g = external.get("google_places") or {}
     est = (research.get("business_signals") or {}).get("established_year_text_match")
     proof = []
@@ -1909,7 +2139,7 @@ def industry_or(external: dict) -> str:
 
 def build_strategy(research, business_name, town, industry, external, comp_sites, extras, nearby) -> dict:
     pages = research.get("pages", [])
-    services = detect_services(research, business_name)
+    services = detect_services(research, business_name, industry)
     matrix = [{"service": n, "listed_on": src, "dedicated_page": service_page_for(n, pages)} for n, src in services]
     towns = []
     for t in [town] + [x.strip() for x in (nearby or "").split(",")]:
@@ -1918,9 +2148,10 @@ def build_strategy(research, business_name, town, industry, external, comp_sites
     loc = location_plan(towns, town, pages, comp_sites)
     gaps = content_gaps(research, comp_sites, business_name)
     return {
+        "industry_profile": industry_profile(industry)["key"],
         "service_coverage": matrix, "location_plan": loc, "competitor_gaps": gaps,
         "link_audit": link_audit(research, extras), "ai_search_readiness": ai_readiness(research, extras, pages),
-        "briefs": build_briefs(business_name, town, matrix, loc, gaps, research, external),
+        "briefs": build_briefs(business_name, town, matrix, loc, gaps, research, external, industry),
         "demand_note": "Search volume and rankings were not measured. Page recommendations rest on what the site contains, what competitors publish and the standard rules for avoiding thin or doorway-style local pages."
     }
 
@@ -1931,11 +2162,17 @@ def strategy_opportunities(st: dict) -> list:
     missing = [m for m in matrix if not m["dedicated_page"]]
     if len(matrix) >= 2 and len(missing) >= 2:
         names = ", ".join(m["service"] for m in missing[:6])
-        out.append({"priority": "High" if len(missing) / len(matrix) >= 0.6 else "Medium",
-                    "title": "Give each core service its own page",
-                    "evidence": f"{len(missing)} of {len(matrix)} detected services have no dedicated page: {names}. They are listed together rather than ranking on their own.",
-                    "action": "Build one focused page per service with its own title, H1, real examples and FAQs. Start with the highest-value service. Briefs are in the strategy section.",
-                    "service_fit": "Service page strategy"})
+        if st.get("industry_profile") == "accommodation":
+            out.append({"priority": "Medium", "title": "Give each room type its own page",
+                        "evidence": f"{len(missing)} of {len(matrix)} detected room or unit names have no page of their own: {names}. They are shown together on shared pages.",
+                        "action": "If the rooms differ in price, bed set-up or view, give each its own page with real photos, rates and a booking link. Briefs are in the strategy section.",
+                        "service_fit": "Service page strategy"})
+        else:
+            out.append({"priority": "High" if len(missing) / len(matrix) >= 0.6 else "Medium",
+                        "title": "Give each core service its own page",
+                        "evidence": f"{len(missing)} of {len(matrix)} detected services have no dedicated page: {names}. They are listed together rather than ranking on their own.",
+                        "action": "Build one focused page per service with its own title, H1, real examples and FAQs. Start with the highest-value service. Briefs are in the strategy section.",
+                        "service_fit": "Service page strategy"})
     for item in st.get("location_plan", []):
         if item["verdict"].startswith("Justified"):
             out.append({"priority": "Medium", "title": f"Consider a page for {item['town']}",
@@ -1951,8 +2188,11 @@ def strategy_opportunities(st: dict) -> list:
                     "service_fit": "Content gap closing"})
     la = st.get("link_audit", {})
     if la.get("duplicate_titles"):
-        out.append({"priority": "Medium", "title": "Fix duplicate page titles",
-                    "evidence": f"{len(la['duplicate_titles'])} title(s) are shared by more than one page, which makes pages compete with each other.",
+        worst = max(len(d["pages"]) for d in la["duplicate_titles"])
+        out.append({"priority": "High" if worst >= max(3, la.get("pages_crawled", 0) / 2) else "Medium",
+                    "title": "Fix duplicate page titles",
+                    "evidence": (f"{len(la['duplicate_titles'])} title(s) are shared by more than one page, which makes pages compete "
+                                 f"with each other. The most repeated title is used on {worst} of {la.get('pages_crawled', 0)} pages."),
                     "action": "Give every page a unique title that names its own topic and town.",
                     "service_fit": "On-page SEO"})
     pages_n = max(la.get("pages_crawled", 0), 1)
@@ -1964,7 +2204,7 @@ def strategy_opportunities(st: dict) -> list:
     fixes = [c for c in st.get("ai_search_readiness", []) if c["status"] == "Fix"]
     if len(fixes) >= 3:
         out.append({"priority": "Medium", "title": "Improve AI search readiness",
-                    "evidence": f"{len(fixes)} checks need work: " + "; ".join(c["check"] for c in fixes[:5]) + ".",
+                    "evidence": f"{len(fixes)} checks need work: " + "; ".join(c["check"] for c in fixes) + ".",
                     "action": "Add LocalBusiness schema with sameAs links, answer real customer questions on key pages and make the business details consistent across the web.",
                     "service_fit": "AI and local search visibility"})
     return out
@@ -2495,7 +2735,8 @@ def make_pdf(audit: dict) -> str:
 
 CONTENT_DEPENDENT = {
     "Improve website enquiry path", "Fix on-page SEO basics", "Expand useful service and location content",
-    "Make the offer and service area clearer", "Give each core service its own page",
+    "Make the offer and service area clearer", "Give each core service its own page", "Give each room type its own page",
+    "Make rates and booking easy to find",
     "Add content types competitors already publish", "Strengthen internal linking", "Fix duplicate page titles",
     "Confirm and connect relevant social profiles"
 }
@@ -2524,12 +2765,12 @@ def assess_confidence(research, listing, external, comp_sites, town, js) -> dict
     return {"level": "Low" if low else "Medium" if med else "High", "reasons": low + med}
 
 
-def build_review_checklist(conf: dict) -> list:
+def build_review_checklist(conf: dict, industry: str = "") -> list:
     items = ["Open the Google Maps link and confirm it is the same business (name, address, phone).",
              "Check each competitor is a real local rival, not a directory, supplier or national chain.",
              "Confirm the detected town and business type are right.",
              "Open the site yourself and make sure the top findings are visible to a normal visitor.",
-             "Check HelloPeter and Trustpilot by hand before mentioning reviews."]
+             f"Check {industry_profile(industry)['review_platforms']} by hand before mentioning reviews."]
     return items + ["Resolve: " + r for r in conf.get("reasons", [])]
 
 
@@ -2618,10 +2859,25 @@ def run_audit(website: str, business_name: str = "", location: str = "", industr
         external["competitor_candidates"] = (
             [{"title": domain_of(u), "url": u, "snippet": "Supplied manually", "query": "manual"} for u in manual_comp[:5]]
             + external.get("competitor_candidates", []))
+    # Other businesses returned by the same Google Maps lookup are free competitor leads (no extra search used).
+    maps_leads = []
+    for other in (listing.get("other_candidates") or []):
+        site = clean_text(other.get("website"))
+        if not site or domain in site.lower() or any(d in site.lower() for d in DIRECTORY_HOSTS):
+            continue
+        try:
+            maps_leads.append({"title": clean_text(other.get("name")) or domain_of(site), "url": normalize_input_url(site),
+                               "snippet": "Nearby business returned by the Google Maps lookup (a lead to verify)",
+                               "query": "google_maps"})
+        except ValueError:
+            pass
+    if maps_leads:
+        have = {c.get("url") for c in external.get("competitor_candidates", [])}
+        external["competitor_candidates"] = external.get("competitor_candidates", []) + [m for m in maps_leads if m["url"] not in have]
 
     step("Scoring the digital presence")
     keywords = extract_keywords(website_research, business_name, location, industry)
-    score = score_presence(website_research, external.get("google_places"))
+    score = score_presence(website_research, external.get("google_places"), industry)
     comp_sites = []
     if competitor_crawl:
         step("Reviewing competitor websites")
@@ -2668,6 +2924,7 @@ def run_audit(website: str, business_name: str = "", location: str = "", industr
         "Scores and recommendations are directional observations, not proof of lost sales and not guarantees of results.",
         "Suggested service prices are draft packaging ideas. Confirm deliverables, time, third-party costs and client needs before quoting."
     ]
+    limitations = [s.replace("HelloPeter and Trustpilot", industry_profile(industry)["review_platforms"]) for s in limitations]
     web_ok = any(sec.get("success") for sec in external.get("searches", {}).values())
     audit = {
         "success": True, "business_name": business_name, "website": website,
@@ -2689,7 +2946,7 @@ def run_audit(website: str, business_name: str = "", location: str = "", industr
     audit["website_redesign_brief"] = build_redesign_brief(
         website_research, strategy, keywords, opportunities, business_name, website
     )
-    audit["review_checklist"] = build_review_checklist(conf)
+    audit["review_checklist"] = build_review_checklist(conf, industry)
     audit["sales_brief"] = build_sales_brief(audit, cfg)
     if generate_pdf:
         step("Writing the PDF report")

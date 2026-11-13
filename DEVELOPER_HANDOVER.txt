@@ -1,6 +1,6 @@
 STRAIGHT UP DIGITAL
 WEB DEVELOPER HANDOVER
-Prepared: 13 November 2026
+Updated: 13 November 2026
 
 ===============================================================================
 1. PURPOSE AND CURRENT STATE
@@ -14,7 +14,8 @@ Git repository:
 https://github.com/stjohntoperformer-sudo/Staightupdigital
 
 Current branch: master
-Latest repository commit: 684b9ca (Use replacement logo asset archive)
+For the latest revision, use the current `master` branch head in the repository.
+This handover is updated alongside the source it describes.
 
 Important: the repository currently contains a local-first Python application.
 It is not currently a finished marketing website or a production-hosted CRM.
@@ -220,6 +221,12 @@ Business website audit:
   three competitor sites with a small page limit.
 - Produces ordered recommendations and draft service/location/FAQ content
   briefs. Search demand and rankings are not measured by this analysis.
+- Recognizes accommodation businesses such as guest houses, B&Bs, hotels, and
+  lodges, and adapts search terms, review-platform prompts, scoring, booking
+  recommendations, and room/rates content briefs. Trade-focused behavior
+  remains the default for other industries.
+- Can flag an HTTPS issue or a mismatch between the verified Google listing
+  name and the website name when the available evidence supports it.
 - Can generate a PDF report using ReportLab and a configurable brand template.
 
 Search and lead research:
@@ -278,6 +285,10 @@ Audit queue:
 - town_sweep.py / find_unlisted.py / rank_check.py
   Separate lead discovery, sweep, and search-rank utilities.
 
+- sweep_compliance.py
+  Imports an existing town-sweep result without making network searches. It
+  applies suppression checks and the selected tenant context before importing.
+
 - storage.py
   Storage protocol and local filesystem implementation. Local is the only
   implemented backend; non-local backends raise an error.
@@ -293,9 +304,12 @@ Audit queue:
 - assets/templates/pdf_brand.json
   PDF brand defaults and logo-path setting.
 
-- tests/test_crm_web_pdf.py
-  HTTP-level regression test proving a tenant can download its own PDF but
-  receives 404 for another tenant's audit PDF.
+- tests/
+  Automated regression tests cover PDF tenant isolation, tenant migration and
+  sweep-import scoping, URL normalization, accommodation-profile scoring and
+  content, suppression matching, MCP bearer authentication, SSRF and response
+  limits, audit/search quotas, job-result retention, and cross-process town
+  sweep quota reservations.
 
 The repository does not currently have a tracked README or public frontend
 configuration. Use this handover plus source code as orientation, and add
@@ -350,8 +364,9 @@ Current isolation and limitations:
 - The code uses a configured CRM_TENANT_ID and many database operations are
   tenant-filtered. It is a single local deployment context, not a fully
   authenticated multi-customer SaaS service.
-- No user login, roles, password/session management, or production
-  authentication/authorization layer was confirmed in the CRM.
+- The CRM browser UI has no user login, roles, password/session management,
+  or production authentication/authorization layer. MCP HTTP endpoints have
+  separate Bearer-token authentication; this does not authenticate CRM users.
 - The local server binds to loopback and POST handlers reject non-loopback
   requests. Do not remove these protections or expose this server directly to
   the internet.
@@ -393,7 +408,9 @@ Observed integration paths:
   results.
 - OpenStreetMap Overpass: optional supplementary business search.
 - Public business websites: fetched with httpx; crawl limits and robots.txt
-  behavior apply.
+  behavior apply. DNS resolution fails closed, outbound connections are
+  pinned to validated public addresses, and response bodies are limited to
+  2 MiB.
 - ReportLab: PDF reports.
 - MCP: business_auditor.py --serve and server.py expose streamable HTTP behind
   an MCP_BEARER_TOKEN check. The token must contain at least 32 characters;

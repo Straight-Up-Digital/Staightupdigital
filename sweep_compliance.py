@@ -28,8 +28,7 @@ def filter_payload(payload:dict,db_path:Path=DB,tenant_id:str|None=None)->tuple[
 def import_existing_sweep(path:str|Path,db_path:Path=DB,tenant_id:str|None=None)->dict:
  payload=json.loads(Path(path).read_text(encoding='utf-8'));filtered,skipped=filter_payload(payload,db_path,tenant_id)
  # Reuse existing importer; never invokes SerpApi or town_sweep.run_sweep.
- from crm import import_sweep
- result=import_sweep_payload(filtered,db_path)
+ result=import_sweep_payload(filtered,db_path,tenant_id)
  result['suppression_skipped']=skipped
  return result
 

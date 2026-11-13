@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -5,7 +6,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
-from sweep_compliance import filter_payload
+from sweep_compliance import filter_payload, import_existing_sweep
 
 
 class SweepTenantMigrationTests(unittest.TestCase):
@@ -63,6 +64,20 @@ class SweepTenantMigrationTests(unittest.TestCase):
         with closing(sqlite3.connect(self.db_path)) as connection:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(contacts)")}
         self.assertNotIn("tenant_id", columns)
+
+    def test_existing_sweep_import_passes_selected_tenant_to_importer(self):
+        sweep_path = Path(self.temp_dir.name) / "sweep.json"
+        payload = {"leads": []}
+        sweep_path.write_text(json.dumps(payload), encoding="utf-8")
+        filtered = {"leads": [], "suppression_skipped": 0}
+
+        with (
+            patch("sweep_compliance.filter_payload", return_value=(filtered, 0)),
+            patch("sweep_compliance.import_sweep_payload", return_value={"imported": 0}) as importer,
+        ):
+            import_existing_sweep(sweep_path, self.db_path, tenant_id="tenant-b")
+
+        importer.assert_called_once_with(filtered, self.db_path, "tenant-b")
 
 
 if __name__ == "__main__":
