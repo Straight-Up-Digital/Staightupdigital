@@ -1,0 +1,36 @@
+﻿# Python environments
+.venv/
+venv/
+env/
+
+# Python temporary files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Private configuration
+.env
+.env.*
+!.env.example
+Serp Api Key.txt
+
+# Business data and generated reports
+reports/
+backups/
+/auditor_config.json
+/status_report.txt
+
+# Local editor settings and source backups
+/.vscode/
+/auditor_backup.py
+/scoring_backup.py
+
+# Tunnel executables and runtime files
+Tunnel_client/
+Tunnel_client_full/
+
+# Operating system files
+Thumbs.db
+.DS_Store

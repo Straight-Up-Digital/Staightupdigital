@@ -1,0 +1,11 @@
+{
+  "agency_name": "Straight Up Digital",
+  "primary_color": "#101010",
+  "accent_color": "#F04A0A",
+  "text_color": "#202020",
+  "muted_color": "#666666",
+  "logo_path_env": "CRM_PDF_LOGO_PATH",
+  "cover_title": "LOCAL BUSINESS GROWTH AUDIT",
+  "footer_text": "Straight Up Digital | Evidence-led audit",
+  "show_draft_notice": true
+}

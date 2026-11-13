@@ -1,0 +1,1151 @@
+"""Local-only CRM UI and single-contact audit workflow."""
+from __future__ import annotations
+
+import csv
+import hashlib
+import html
+import io
+import json
+import os
+import re
+import threading
+import uuid
+from datetime import date, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, quote, urlparse
+
+from crm import DEFAULT_DB, audit_history, connect, get_contact, list_contacts, save_audit_result, save_contact_fields, update_scope_item
+from config_loader import env, load_env
+from security import tenant_context
+from security_schema import add_suppression, count_for_tenant, migrate
+
+HOST = "127.0.0.1"
+PORT = int(os.environ.get("CRM_PORT", "8765"))
+PROJECT_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = PROJECT_DIR / "auditor_config.json"
+FINDER_DIR = PROJECT_DIR / "reports" / "finder"
+RANK_DIR = PROJECT_DIR / "reports" / "rankings"
+LOCKUP = Path(r"C:\Users\Saint\Straight Up Digital\straight-up-digital-logo-pngs\02-lockup-horizontal\lockup-dark-bg-1000w.png")
+LEAD_STAGES = ["new", "contacted", "quoted", "accepted", "live", "lost"]
+LEAD_STATUSES = ["new", "contacted", "qualified", "proposal_sent", "active_client", "not_interested", "do_not_contact"]
+WEBSITE_STATUSES = ["website_found_in_search_unverified", "no_website_surfaced_in_search", "unknown"]
+WEBSITE_DETAILS = ["own_website_listed", "social_page_only", "directory_page_only", "no_website_listed", "unknown"]
+QUOTE_TYPES = ["", "website build", "audit fixes", "retainer", "once-off edit"]
+TOWNS = ["Port Alfred", "Kenton-on-Sea", "Bathurst", "Alexandria", "other"]
+FINDER_SOURCE = "facebook_directory_search"
+AUDIT_LOCK = threading.Lock()
+RANK_LOCK = threading.Lock()
+FINDER_LOCK = threading.Lock()
+FINDER_JOB = {"state": "idle", "town": "", "lines": [], "summary": "", "error": ""}
+
+STAGE_LABEL = {"new": "New", "contacted": "Contacted", "quoted": "Quoted", "accepted": "Accepted", "live": "Live", "lost": "Lost"}
+WEB_LABEL = {"own_website_listed": ("Own website", "info"), "social_page_only": ("Social page only", "warn"),
+             "directory_page_only": ("Directory only", "warn"), "no_website_listed": ("No website", "accent"),
+             "unknown": ("Not checked", "")}
+
+
+def h(value) -> str:
+    return html.escape(str(value if value is not None else ""), quote=True)
+
+
+PLATFORMS = [
+    ("facebook", "Facebook", ("facebook.com", "fb.com", "fb.me")),
+    ("instagram", "Instagram", ("instagram.com",)),
+    ("linkedin", "LinkedIn", ("linkedin.com",)),
+    ("tiktok", "TikTok", ("tiktok.com",)),
+    ("youtube", "YouTube", ("youtube.com", "youtu.be")),
+    ("x", "X (Twitter)", ("x.com", "twitter.com")),
+    ("whatsapp", "WhatsApp", ("wa.me", "whatsapp.com")),
+]
+
+
+def safe_url(value) -> str:
+    """Return a clean http(s) URL, or '' if it is not one. Blocks javascript:, mailto: and similar."""
+    v = str(value or "").strip()
+    if not v or re.search(r"\s", v):
+        return ""
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", v):
+        if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", v) and not re.match(r"^[^/]+\.[a-zA-Z]{2,}(:\d+)?(/|$)", v):
+            return ""
+        v = "https://" + v
+    try:
+        u = urlparse(v)
+    except ValueError:
+        return ""
+    if u.scheme not in ("http", "https") or not u.netloc or "." not in u.netloc:
+        return ""
+    return v
+
+
+def platform_of(url: str) -> str:
+    host = (urlparse(url).hostname or "").lower()
+    for key, _label, domains in PLATFORMS:
+        if any(host == d or host.endswith("." + d) for d in domains):
+            return key
+    return ""
+
+
+def split_socials(urls) -> tuple[dict, list]:
+    """First link per platform fills its own field. Extras and unknown sites go to 'other' so nothing is lost."""
+    by_platform, other = {}, []
+    for raw in urls or []:
+        u = safe_url(raw)
+        if not u:
+            if str(raw).strip():
+                other.append(str(raw).strip())
+            continue
+        key = platform_of(u)
+        if key and key not in by_platform:
+            by_platform[key] = u
+        else:
+            other.append(u)
+    return by_platform, other
+
+
+def money(value) -> str:
+    try:
+        return f"R{float(value):,.0f}"
+    except (TypeError, ValueError):
+        return "R0"
+
+
+def config() -> dict:
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def db_path() -> Path:
+    configured = config().get("crm", {}).get("database_path", str(DEFAULT_DB))
+    path = Path(configured)
+    return path if path.is_absolute() else PROJECT_DIR / path
+
+
+def tenant_id() -> str:
+    return env("CRM_TENANT_ID", "straight-up-digital")
+
+
+def pricing() -> dict:
+    cfg = config()
+    pp = cfg.get("proposal_pricing", {})
+    offer = cfg.get("website_offer", {})
+    return {
+        "build": pp.get("website_build_once_off_zar", offer.get("build_once_off_zar", 1500)),
+        "pages": pp.get("website_build_max_pages", 5),
+        "hosting": pp.get("website_hosting_monthly_zar", offer.get("hosting_monthly_zar", 99)),
+        "point": pp.get("point_rate_zar", pp.get("audit_missing_point_zar", 40)),
+        "edits": pp.get("once_off_edits", {}),
+        "retainers": cfg.get("monthly_retainers", []),
+    }
+
+
+# ---------------------------------------------------------------- look and feel
+
+CSS = """
+:root{
+  --ink:#101114;--ink-2:#3b4048;--muted:#6a717c;--bg:#eff1f3;--panel:#fff;--line:#dde0e5;--line-2:#eceef1;
+  --signal:#f04a0a;--signal-d:#c93a05;--signal-soft:#fff0e9;
+  --ok:#0e7a5a;--ok-soft:#e2f3ec;--warn:#9a5b00;--warn-soft:#fff2d4;--bad:#b3261e;--bad-soft:#fce8e6;--info:#1d4f91;--info-soft:#e5eefa;
+  --rail:#101114;
+  --display:"Bahnschrift","Segoe UI Variable Display","Segoe UI",system-ui,sans-serif;
+  --body:"Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,sans-serif;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 var(--body);font-variant-numeric:tabular-nums}
+a{color:var(--ink);text-decoration-color:#b9bec7;text-underline-offset:2px}
+a:hover{text-decoration-color:var(--signal)}
+h1,h2,h3{font-family:var(--display);margin:0;font-weight:600;letter-spacing:-.01em}
+h1{font-size:28px;line-height:1.15}
+h2{font-size:17px}
+h3{font-size:14px}
+.app{display:grid;grid-template-columns:232px minmax(0,1fr);min-height:100vh}
+.rail{background:var(--rail);color:#c9ccd2;position:sticky;top:0;height:100vh;padding:22px 14px 16px;display:flex;flex-direction:column;gap:26px}
+.logo{width:100%;max-width:190px;height:auto;display:block;padding:0 6px}
+.wordmark{font-family:var(--display);font-weight:700;font-size:19px;color:#fff;padding:0 8px;letter-spacing:-.01em}
+.nav{display:flex;flex-direction:column;gap:2px}
+.nav a{display:flex;align-items:center;gap:11px;padding:9px 10px;border-radius:7px;color:#aeb2ba;text-decoration:none;font-weight:600}
+.nav a:hover{background:#1a1c20;color:#fff}
+.nav a.on{background:#1a1c20;color:#fff;box-shadow:inset 3px 0 0 var(--signal)}
+.ic{width:18px;height:18px;flex:none}
+.rail-foot{margin-top:auto;font-size:12px;color:#7b818c;padding:0 8px;line-height:1.5}
+.rail-foot b{color:#b4b8c0;font-weight:600}
+.main{padding:28px 34px 70px;max-width:1560px;width:100%;min-width:0}
+.head{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;margin-bottom:22px;flex-wrap:wrap}
+.head p{margin:4px 0 0;color:var(--muted);max-width:62ch}
+.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.flash{padding:11px 14px;border-radius:8px;margin-bottom:18px;font-weight:600;background:var(--ok-soft);color:#0b5c44;border:1px solid #bfe1d3}
+.flash.warn{background:var(--warn-soft);color:#7a4700;border-color:#efd493}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px 20px;margin-bottom:18px}
+.panel>h2,.panel-head h2{margin-bottom:12px}
+.panel-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:12px}
+.panel-head h2{margin:0}
+.panel-head span{color:var(--muted);font-size:13px}
+.note{color:var(--muted);font-size:13px;margin:0 0 12px;max-width:70ch}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:9px 15px;border-radius:7px;border:1px solid #cdd1d8;background:#fff;color:var(--ink);font:inherit;font-weight:650;cursor:pointer;text-decoration:none;line-height:1.2}
+.btn:hover{background:#f6f7f9;border-color:#b9bec7}
+.btn.primary{background:var(--signal);border-color:var(--signal);color:#fff}
+.btn.primary:hover{background:var(--signal-d);border-color:var(--signal-d)}
+.btn.dark{background:var(--ink);border-color:var(--ink);color:#fff}
+.btn.dark:hover{background:#262a30}
+.btn.sm{padding:5px 10px;font-size:13px}
+.btn.block{width:100%}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+:focus-visible{outline:2px solid var(--signal);outline-offset:2px}
+input,select,textarea{font:inherit;padding:8px 10px;border:1px solid #cdd1d8;border-radius:6px;background:#fff;color:var(--ink);max-width:100%}
+input:focus,select:focus,textarea:focus{outline:2px solid rgba(240,74,10,.35);border-color:var(--signal)}
+input[readonly]{background:#f3f4f6;color:var(--ink-2)}
+textarea{width:100%;min-height:84px;resize:vertical}
+.pill{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;font-weight:650;background:#eceef1;color:#454b55;white-space:nowrap;line-height:1.7}
+.pill.ok{background:var(--ok-soft);color:var(--ok)}
+.pill.warn{background:var(--warn-soft);color:var(--warn)}
+.pill.bad{background:var(--bad-soft);color:var(--bad)}
+.pill.info{background:var(--info-soft);color:var(--info)}
+.pill.accent{background:var(--signal-soft);color:var(--signal-d)}
+.pill.dark{background:var(--ink);color:#fff}
+.muted{color:var(--muted);overflow-wrap:anywhere}
+.small{font-size:12.5px}
+.avatar{width:36px;height:36px;border-radius:8px;display:grid;place-items:center;font:700 13px var(--display);flex:none;background:#e7e9ee;color:#394150}
+.avatar.t1{background:#e5eefa;color:#1d4f91}.avatar.t2{background:#e2f3ec;color:#0e7a5a}.avatar.t3{background:#fff2d4;color:#8a5200}.avatar.t4{background:#fce8e6;color:#a3241c}
+.avatar.big{width:56px;height:56px;border-radius:12px;font-size:19px}
+
+.hero{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(290px,1fr);gap:18px;margin-bottom:18px;align-items:start}
+.hero .panel{margin:0}
+.today-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 14px;align-items:center;padding:10px 0;border-top:1px solid var(--line-2)}
+.today-row:first-of-type{border-top:0}
+.today-row b a{text-decoration:none}
+.empty{padding:14px 0;color:var(--muted)}
+.mrr{background:var(--ink);color:#fff;border-color:var(--ink)}
+.mrr .big{font:700 44px/1 var(--display);letter-spacing:-.02em;color:#fff}
+.mrr .big small{font-size:16px;font-weight:500;color:#9aa0ab;margin-left:6px}
+.mrr p{color:#9aa0ab;margin:8px 0 0}
+.finder-links{display:flex;flex-direction:column;gap:10px;margin-top:6px}
+.finder-links form{display:flex;gap:8px;flex-wrap:wrap}
+.finder-links input{flex:1;min-width:120px}
+
+.funnel{display:flex;height:10px;border-radius:6px;overflow:hidden;background:var(--line-2);margin:2px 0 14px}
+.funnel .seg{display:block;height:100%}
+.seg-new{background:#b8bec9}.seg-contacted{background:#6d98d6}.seg-quoted{background:#e8a91d}.seg-accepted{background:var(--signal)}.seg-live{background:#13a07a}.seg-lost{background:#d79a96}
+.stages{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px}
+.stage{display:block;text-decoration:none;padding:8px 10px;border-radius:7px;border:1px solid transparent}
+.stage:hover{background:#f5f6f8;border-color:var(--line)}
+.stage b{display:block;font:700 26px/1.1 var(--display);letter-spacing:-.01em}
+.stage span{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:13px}
+.stage span i{width:8px;height:8px;border-radius:50%;display:inline-block}
+
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 12px}
+.chip{display:inline-flex;gap:7px;align-items:center;padding:5px 11px;border:1px solid var(--line);background:#fff;border-radius:999px;text-decoration:none;font-weight:600;font-size:13px;color:var(--ink-2)}
+.chip b{font-weight:700;color:var(--ink)}
+.chip:hover{border-color:#b9bec7}
+.chip.on{background:var(--ink);border-color:var(--ink);color:#fff}
+.chip.on b{color:#fff}
+.filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+.filters input[type=search]{flex:1;min-width:220px}
+
+.tbl-wrap{overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:10px;max-height:72vh}
+table{border-collapse:collapse;width:100%;min-width:980px}
+th{position:sticky;top:0;z-index:1;background:#f7f8fa;text-align:left;font-size:12.5px;font-weight:650;color:var(--muted);padding:10px 14px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:11px 14px;border-bottom:1px solid var(--line-2);vertical-align:middle}
+tbody tr:hover{background:#fafbfc}
+tbody tr:last-child td{border-bottom:0}
+.biz{display:flex;gap:11px;align-items:center;min-width:220px}
+.biz a{font-weight:650;text-decoration:none}
+.biz a:hover{text-decoration:underline;text-decoration-color:var(--signal)}
+.due{color:var(--bad);font-weight:650}
+.stars{color:#b7791f}
+
+.profile{display:grid;grid-template-columns:minmax(0,1fr) 390px;gap:20px;align-items:start}
+.profile>*{min-width:0}
+.aside{position:sticky;top:18px}
+.phead{display:flex;gap:16px;align-items:center;margin-bottom:20px;flex-wrap:wrap}
+.phead .who{flex:1;min-width:240px}
+.phead .tags{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.crumb{color:var(--muted);margin-bottom:12px;font-size:13px}
+.crumb a{color:var(--muted)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:13px 14px}
+.field label.lab{display:block;font-weight:600;margin-bottom:4px;font-size:13px;color:var(--ink-2)}
+.field input,.field select,.field textarea{width:100%}
+.wide{grid-column:1/-1}
+.panel input[type=checkbox]{width:auto;padding:0;flex:none}
+.nw{white-space:nowrap}
+.row-actions{display:flex;gap:6px;flex-wrap:nowrap}
+.checks{display:flex;flex-direction:column;gap:8px;grid-column:1/-1;padding:12px 14px;background:#f7f8fa;border-radius:8px;border:1px solid var(--line-2)}
+.checks label{display:flex;gap:9px;align-items:flex-start;font-weight:500}
+.checks input{margin-top:3px}
+.savebar{position:sticky;bottom:0;background:rgba(239,241,243,.94);backdrop-filter:blur(6px);padding:12px 0;margin-top:4px;display:flex;justify-content:flex-end;gap:10px;border-top:1px solid var(--line)}
+.stack{display:flex;flex-direction:column;gap:10px}
+.rule{border:0;border-top:1px solid var(--line-2);margin:14px 0}
+.rank-form{display:grid;grid-template-columns:minmax(0,1fr);gap:8px}
+.rank-form>*{min-width:0;width:100%}
+.rank-table{width:100%;min-width:0;font-size:13px}
+.rank-table th{position:static;padding:6px 8px;background:transparent;font-size:12px}
+.rank-table td{padding:7px 8px}
+.banner{padding:10px 14px;border-radius:8px;margin-bottom:16px;font-weight:600;background:var(--info-soft);color:var(--info);border:1px solid #c6d9f2}
+.banner.bad{background:var(--bad-soft);color:var(--bad);border-color:#f2c5c1}
+.history{border-top:1px solid var(--line-2);padding:14px 0}
+.history:first-of-type{border-top:0}
+.history summary{cursor:pointer;font-weight:650;margin-top:10px}
+.history .scope{padding:9px 10px;border-top:1px solid var(--line-2)}
+.history .scope p{margin:3px 0 3px 26px;color:var(--ink-2)}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f7f8fa;padding:12px;border-radius:7px;font-size:12px}
+.src-links a{display:block;overflow-wrap:anywhere;margin:5px 0}
+.job{display:flex;gap:10px;align-items:flex-start}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--signal);margin-top:6px;flex:none;animation:pulse 1.2s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.25}}
+@media (prefers-reduced-motion:reduce){.dot{animation:none}}
+.log{font:12px/1.5 Consolas,ui-monospace,monospace;color:var(--ink-2);margin:8px 0 0;background:#f7f8fa;border-radius:7px;padding:10px 12px;max-height:150px;overflow:auto}
+.srcs{display:flex;gap:5px;flex-wrap:wrap}
+
+@media (max-width:1100px){.profile{grid-template-columns:minmax(0,1fr)}.aside{position:static}.hero{grid-template-columns:1fr}}
+@media (max-width:860px){
+  .app{grid-template-columns:minmax(0,1fr)}
+  .rail{position:static;height:auto;flex-direction:row;align-items:center;flex-wrap:wrap;padding:12px 14px;gap:12px}
+  .logo{max-width:130px}.nav{flex-direction:row;flex-wrap:wrap}.rail-foot{display:none}
+  .main{padding:20px 16px 60px}
+  .stages{grid-template-columns:repeat(3,minmax(0,1fr))}
+}
+"""
+
+JS = """
+document.addEventListener('change',function(e){
+  var t=e.target;
+  if(t&&t.matches&&t.matches('[data-all]')){
+    var f=t.closest('form');
+    f.querySelectorAll('input[name="pick"]').forEach(function(c){c.checked=t.checked;});
+  }
+});
+"""
+
+ICONS = {
+    "leads": '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.9"/><path d="M16 3.1a4 4 0 0 1 0 7.8"/>',
+    "notlisted": '<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/><path d="M8 11h6"/>',
+    "shield": '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/>',
+}
+
+
+def icon(name: str) -> str:
+    return ('<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" '
+            f'stroke-linejoin="round" aria-hidden="true">{ICONS[name]}</svg>')
+
+
+def layout(title: str, body: str, active: str = "leads", message: str = "", refresh: int = 0) -> bytes:
+    cfg = config()
+    if LOCKUP.is_file():
+        brand = '<img class="logo" src="/brand-logo" alt="Straight Up Digital">'
+    else:
+        brand = f'<div class="wordmark">{h(cfg.get("agency_name", "Straight Up Digital"))}</div>'
+    nav_items = [("leads", "/", "Leads"), ("notlisted", "/not-listed", "Not listed"), ("shield", "/suppression", "Do not contact")]
+    nav = "".join(f'<a href="{href}" class="{"on" if key == active or (key == "shield" and active == "suppression") else ""}">{icon(key)}{label}</a>'
+                  for key, href, label in nav_items)
+    flash = ""
+    if message:
+        warn = any(w in message.lower() for w in ("fail", "error", "not ", "required", "verify", "refused", "missing", "only ", "already", "expired"))
+        flash = f'<div class="flash{" warn" if warn else ""}" role="status">{h(message)}</div>'
+    meta = f'<meta http-equiv="refresh" content="{int(refresh)}">' if refresh else ""
+    doc = (f'<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+           f'<title>{h(title)} | Straight Up Digital CRM</title>{meta}<style>{CSS}</style></head><body><div class="app">'
+           f'<aside class="rail">{brand}<nav class="nav">{nav}</nav>'
+           f'<div class="rail-foot"><b>Local CRM</b><br>{HOST}:{PORT}<br>{h(tenant_id())}</div></aside>'
+           f'<main class="main">{flash}{body}</main></div><script>{JS}</script></body></html>')
+    return doc.encode("utf-8")
+
+
+def avatar(name: str, big: bool = False) -> str:
+    words = re.findall(r"[A-Za-z0-9]+", name or "")
+    initials = "".join(w[0] for w in words[:2]).upper() or "?"
+    tint = int(hashlib.md5((name or "").encode("utf-8")).hexdigest(), 16) % 5
+    return f'<span class="avatar t{tint}{" big" if big else ""}" aria-hidden="true">{h(initials)}</span>'
+
+
+def stage_pill(stage: str) -> str:
+    cls = {"new": "", "contacted": "info", "quoted": "warn", "accepted": "accent", "live": "ok", "lost": "bad"}.get(stage, "")
+    return f'<span class="pill {cls}">{h(STAGE_LABEL.get(stage, str(stage or "new").title()))}</span>'
+
+
+def web_pill(detail: str) -> str:
+    label, cls = WEB_LABEL.get(detail or "unknown", WEB_LABEL["unknown"])
+    return f'<span class="pill {cls}">{h(label)}</span>'
+
+
+def _select(name: str, values: list[str], selected: str, labels=None, attrs="") -> str:
+    labels = labels or {}
+    options = [f'<option value="{h(v)}"{" selected" if v == selected else ""}>{h(labels.get(v, v.replace("_", " ") or "Choose one"))}</option>' for v in values]
+    return f'<select name="{h(name)}" {attrs}>' + "".join(options) + "</select>"
+
+
+def _stars(rating, reviews) -> str:
+    if rating is None:
+        return '<span class="muted">None</span>'
+    count = f' <span class="muted">({h(reviews)})</span>' if reviews is not None else ""
+    return f'<span class="stars">&#9733;</span> {h(rating)}{count}'
+
+
+# ---------------------------------------------------------------- leads page
+
+def _funnel(contacts: list[dict]) -> str:
+    counts = {s: sum(1 for c in contacts if c.get("pipeline_stage") == s) for s in LEAD_STAGES}
+    total = max(sum(counts.values()), 1)
+    bar = "".join(f'<i class="seg seg-{s}" style="width:{counts[s] / total * 100:.2f}%" title="{h(STAGE_LABEL[s])}: {counts[s]}"></i>'
+                  for s in LEAD_STAGES if counts[s])
+    cells = "".join(f'<a class="stage" href="/?stage={s}"><b>{counts[s]}</b><span><i class="seg-{s}"></i>{h(STAGE_LABEL[s])}</span></a>' for s in LEAD_STAGES)
+    return f'<div class="funnel" aria-hidden="true">{bar}</div><div class="stages">{cells}</div>'
+
+
+def _today_panel(contacts: list[dict]) -> str:
+    today = date.today().isoformat()
+    due = sorted((c for c in contacts if c.get("next_follow_up_date") and c["next_follow_up_date"] <= today
+                  and c.get("pipeline_stage") not in ("live", "lost")), key=lambda c: c["next_follow_up_date"])
+    rows = []
+    for c in due[:8]:
+        overdue = c["next_follow_up_date"] < today
+        when = f'<span class="due">Overdue since {h(c["next_follow_up_date"])}</span>' if overdue else '<span class="pill accent">Due today</span>'
+        rows.append(f'<div class="today-row"><div><b><a href="/contact/{c["id"]}">{h(c["business_name"])}</a></b>'
+                    f'<div class="muted small">{h(c.get("phone") or "No phone saved")}</div></div><div>{when}</div></div>')
+    more = f'<p class="muted small">And {len(due) - 8} more.</p>' if len(due) > 8 else ""
+    body = "".join(rows) or '<div class="empty">Nothing is due. Open a lead and set a follow-up date to see it here.</div>'
+    return f'<section class="panel"><div class="panel-head"><h2>Follow up today</h2><span>{len(due)} waiting</span></div>{body}{more}</section>'
+
+
+def _contact_rows(contacts: list[dict]) -> str:
+    today = date.today().isoformat()
+    rows = []
+    for c in contacts:
+        maps = f'https://www.google.com/maps/search/?api=1&query={quote(c.get("business_name", "") + " " + c.get("address", ""))}'
+        badge = ' <span class="pill dark">Not on Maps</span>' if c.get("found_via") == FINDER_SOURCE else ""
+        follow = c.get("next_follow_up_date") or ""
+        if follow and follow < today and c.get("pipeline_stage") not in ("live", "lost"):
+            follow_html = f'<span class="due">{h(follow)}</span>'
+        else:
+            follow_html = h(follow) if follow else '<span class="muted">None set</span>'
+        contact = h(c.get("phone")) or '<span class="muted">None</span>'
+        if c.get("email"):
+            contact += f'<div class="muted small">{h(c.get("email"))}</div>'
+        rows.append(
+            f'<tr><td><div class="biz">{avatar(c["business_name"])}<div><a href="/contact/{c["id"]}">{h(c["business_name"])}</a>{badge}'
+            f'<div class="muted small">{h(c.get("sector"))}</div></div></div></td>'
+            f'<td class="nw">{h(c.get("town"))}</td><td class="nw">{contact}</td><td>{web_pill(c.get("website_detail"))}</td>'
+            f'<td class="nw">{_stars(c.get("rating"), c.get("review_count"))}</td><td>{stage_pill(c.get("pipeline_stage"))}</td>'
+            f'<td class="nw">{follow_html}</td><td><div class="row-actions"><a class="btn sm" href="/contact/{c["id"]}">Open</a>'
+            f'<a class="btn sm" target="_blank" rel="noreferrer" href="{h(maps)}">Maps</a></div></td></tr>')
+    return "".join(rows) or '<tr><td colspan="8"><div class="empty">No leads match these filters.</div></td></tr>'
+
+
+def main_page(params: dict[str, str], message: str = "") -> bytes:
+    tenant = tenant_id()
+    p = pricing()
+    all_contacts = list_contacts(db_path(), tenant_id=tenant, limit=5000)
+    filters = {k: params.get(k, "") for k in ("q", "website_status", "website_detail", "town", "stage")}
+    src = params.get("src", "")
+    outreach = params.get("outreach_allowed", "")
+    contacts = list_contacts(db_path(), website_status=filters["website_status"], town=filters["town"],
+                             website_detail=filters["website_detail"], stage=filters["stage"],
+                             outreach_allowed=int(outreach) if outreach in ("0", "1") else None,
+                             tenant_id=tenant, limit=5000)
+    if src == "not_listed":
+        contacts = [c for c in contacts if c.get("found_via") == FINDER_SOURCE]
+    q = filters["q"].casefold()
+    if q:
+        contacts = [c for c in contacts if q in " ".join(str(c.get(k) or "") for k in
+                    ("business_name", "first_name", "surname", "phone", "email", "address", "website_url", "sector", "notes")).casefold()]
+    mrr = sum(float(c.get("monthly_fee") or 0) + (p["hosting"] if c.get("hosting_enabled") else 0)
+              for c in all_contacts if c.get("pipeline_stage") == "live")
+    live = sum(1 for c in all_contacts if c.get("pipeline_stage") == "live")
+
+    counts = {s: sum(1 for c in all_contacts if c.get("website_detail") == s) for s in WEBSITE_DETAILS}
+    not_listed_n = sum(1 for c in all_contacts if c.get("found_via") == FINDER_SOURCE)
+    chip_defs = [("All", "/", len(all_contacts), not any(filters.values()) and not src)]
+    for key, label in (("own_website_listed", "Own website"), ("no_website_listed", "No website"),
+                       ("social_page_only", "Social page only"), ("directory_page_only", "Directory only")):
+        chip_defs.append((label, f"/?website_detail={key}", counts[key], filters["website_detail"] == key and not src))
+    chip_defs.append(("Not on Google Maps", "/?src=not_listed", not_listed_n, src == "not_listed"))
+    chips = "".join(f'<a class="chip{" on" if on else ""}" href="{href}">{h(label)} <b>{n}</b></a>' for label, href, n, on in chip_defs)
+
+    csv_params = "&".join(f"{k}={quote(v)}" for k, v in filters.items() if v)
+    town_opts = '<option value="">All towns</option>' + "".join(f'<option value="{h(t)}"{" selected" if filters["town"] == t else ""}>{h(t)}</option>' for t in TOWNS)
+    stage_opts = '<option value="">All stages</option>' + "".join(f'<option value="{h(t)}"{" selected" if filters["stage"] == t else ""}>{h(STAGE_LABEL[t])}</option>' for t in LEAD_STAGES)
+    detail_opts = '<option value="">Any web presence</option>' + "".join(
+        f'<option value="{h(t)}"{" selected" if filters["website_detail"] == t else ""}>{h(WEB_LABEL[t][0])}</option>' for t in WEBSITE_DETAILS)
+    outreach_opts = (f'<option value="">Outreach: any</option><option value="1"{" selected" if outreach == "1" else ""}>Outreach allowed</option>'
+                     f'<option value="0"{" selected" if outreach == "0" else ""}>Outreach not allowed</option>')
+    hidden_src = f'<input type="hidden" name="src" value="{h(src)}">' if src else ""
+    edit_prices = "".join(f'<li>{h(k.replace("_", " ").capitalize())}: {money(v)}</li>' for k, v in p["edits"].items())
+    retainer_list = "".join(f'<li>{h(x.get("name"))}: {money(x.get("price_zar_month"))} a month</li>' for x in p["retainers"])
+
+    body = f'''
+<div class="head"><div><h1>Leads</h1><p>Check public listings before you contact anyone. A search that finds no website does not prove the business has none.</p></div>
+<div class="actions"><a class="btn" href="/export.csv?{csv_params}">Export CSV</a></div></div>
+<div class="hero">{_today_panel(all_contacts)}
+<div class="stack"><section class="panel mrr"><h3 style="color:#9aa0ab;font-weight:500">Monthly recurring income</h3>
+<div class="big">{money(mrr)}<small>a month</small></div><p>From {live} live client{"s" if live != 1 else ""}, including hosting.</p></section>
+<section class="panel"><h2>Find more leads</h2><div class="finder-links">
+<form method="get" action="/sweep/plan"><input name="town" required placeholder="Town, for example Kenton-on-Sea" aria-label="Town"><input name="max_searches" type="number" min="1" max="50" value="12" style="width:72px" aria-label="Most searches"><button class="btn dark">Plan Google Maps search</button></form>
+<p class="note" style="margin:0">Planning is free. Nothing is searched until you confirm the count.</p>
+<a class="btn" href="/not-listed">Find businesses not on Google Maps</a></div></section></div></div>
+<section class="panel"><div class="panel-head"><h2>Pipeline</h2><span>{len(all_contacts)} leads in total</span></div>{_funnel(all_contacts)}</section>
+<div class="chips">{chips}</div>
+<form class="filters" method="get">{hidden_src}<input type="search" name="q" value="{h(filters["q"])}" placeholder="Search business, contact, phone, address" aria-label="Search leads">
+<select name="website_detail" aria-label="Web presence">{detail_opts}</select><select name="town" aria-label="Town">{town_opts}</select>
+<select name="stage" aria-label="Stage">{stage_opts}</select><select name="outreach_allowed" aria-label="Outreach">{outreach_opts}</select>
+<button class="btn dark">Filter</button><a class="btn" href="/">Clear</a></form>
+<div class="muted small" style="margin-bottom:8px">Showing {len(contacts)} of {len(all_contacts)}</div>
+<div class="tbl-wrap"><table><thead><tr><th>Business</th><th>Town</th><th>Contact</th><th>Web presence</th><th>Google rating</th><th>Stage</th><th>Follow up</th><th></th></tr></thead>
+<tbody>{_contact_rows(contacts)}</tbody></table></div>
+<details class="panel" style="margin-top:18px"><summary style="cursor:pointer;font-weight:650">Pricing reference</summary>
+<p style="margin:12px 0 4px">Website build up to {p["pages"]} pages: <b>{money(p["build"])}</b> once off. Hosting: <b>{money(p["hosting"])}</b> a month. Audit fixes: <b>{money(p["point"])}</b> per missing point.</p>
+{f'<h3 style="margin:12px 0 4px">Monthly retainers</h3><ul>{retainer_list}</ul>' if retainer_list else ''}
+{f'<h3 style="margin:12px 0 4px">Once-off edits</h3><ul>{edit_prices}</ul>' if edit_prices else ''}</details>
+<p class="muted small">Database: {h(db_path())}</p>'''
+    return layout("Leads", body, "leads", message)
+
+
+# ---------------------------------------------------------------- profile page
+
+def rank_history(contact_id: int) -> list[dict]:
+    out = []
+    try:
+        for path in sorted(RANK_DIR.glob(f"rank-contact-{int(contact_id)}-*.json"), reverse=True)[:3]:
+            try:
+                out.append(json.loads(path.read_text(encoding="utf-8")))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def _rank_pill(position) -> str:
+    if not position:
+        return '<span class="pill">Not found</span>'
+    cls = "ok" if position <= 3 else ("info" if position <= 10 else "warn")
+    return f'<span class="pill {cls}">#{int(position)}</span>'
+
+
+def _rank_block(contact_id: int) -> str:
+    runs = rank_history(contact_id)
+    if not runs:
+        return '<p class="note" style="margin:12px 0 0">No ranking check yet. Run one to see where this business shows up when a customer searches.</p>'
+    latest = runs[0]
+    rows = "".join(
+        f'<tr><td>{h(r.get("keyword"))}<div class="muted small">{h(r.get("match_type") or "no match")}</div></td>'
+        f'<td>{_rank_pill(r.get("position"))}</td><td>{("#" + str(r["map_pack_position"])) if r.get("map_pack_position") else "<span class=muted>None</span>"}</td></tr>'
+        for r in latest.get("results", []))
+    when = h(str(latest.get("generated_at", ""))[:16].replace("T", " "))
+    kind = "Google (South Africa)" if latest.get("source") == "serpapi" else "Free search, indicative only"
+    err = f'<p class="note" style="color:var(--bad)">Some searches failed: {h("; ".join(latest.get("errors", []))[:200])}</p>' if latest.get("errors") else ""
+    return (f'<hr class="rule"><h3>Latest check</h3><p class="note" style="margin:2px 0 8px">{when}. {h(kind)}. This is one search on one day, so say "when I searched on {when[:10]}".</p>'
+            f'<table class="rank-table"><thead><tr><th>Search</th><th>Position</th><th>Map pack</th></tr></thead><tbody>{rows}</tbody></table>{err}')
+
+
+def _audit_job_banner(contact_id: int) -> tuple[str, int]:
+    try:
+        with connect(db_path()) as conn:
+            row = conn.execute("select job_id,status,error_log from audit_jobs where contact_id=? and tenant_id=? order by created_at desc limit 1",
+                               (int(contact_id), tenant_id())).fetchone()
+    except Exception:
+        return "", 0
+    if not row:
+        return "", 0
+    status = row["status"]
+    if status in ("queued", "processing"):
+        return ('<div class="banner"><span class="job"><span class="dot"></span><span>An audit is running for this business. This page refreshes by itself. '
+                'It can take a few minutes.</span></span></div>'), 6
+    if status == "failed" and row["error_log"]:
+        return f'<div class="banner bad">The last audit failed: {h(str(row["error_log"])[:300])}</div>', 0
+    return "", 0
+
+
+def profile_page(contact_id: int, message: str = "") -> tuple[bytes, int]:
+    tenant = tenant_id()
+    c = get_contact(contact_id, db_path(), tenant)
+    if not c:
+        return b"Customer not found", 0
+    p = pricing()
+    histories = audit_history(contact_id, db_path(), tenant)
+    is_verified = bool(c.get("details_verified"))
+    website_allowed = c.get("website_detail") == "own_website_listed" and bool(c.get("website_url"))
+    banner, refresh = _audit_job_banner(contact_id)
+
+    def field(label, name, value="", kind="text", extra="", wide=False):
+        return (f'<div class="field{" wide" if wide else ""}"><label class="lab" for="{h(name)}">{h(label)}</label>'
+                f'<input id="{h(name)}" name="{h(name)}" type="{kind}" value="{h(value)}" {extra}></div>')
+
+    def select_field(label, name, options, selected, labels=None):
+        return f'<div class="field"><label class="lab">{h(label)}</label>{_select(name, options, selected, labels)}</div>'
+
+    soc_map, soc_other = split_socials(c.get("social_links", []))
+    soc_rows = []
+    for key, label, _d in PLATFORMS:
+        val = soc_map.get(key, "")
+        open_link = (f'<a class="btn sm" target="_blank" rel="noreferrer" href="{h(val)}">Open</a>' if val else "")
+        soc_rows.append(f'<div class="field"><label class="lab" for="social_{key}">{h(label)}</label>'
+                        f'<div class="actions"><input id="social_{key}" name="social_{key}" type="url" placeholder="https://" value="{h(val)}" style="flex:1;min-width:0">{open_link}</div></div>')
+    social_panel = (f'<section class="panel"><h2>Social media</h2><div class="grid">{"".join(soc_rows)}'
+                    f'<div class="field wide"><label class="lab" for="social_other">Other links, one per line</label>'
+                    f'<textarea id="social_other" name="social_other">{h(chr(10).join(soc_other))}</textarea></div></div></section>')
+    soc_chips = "".join(
+        f'<a class="chip" target="_blank" rel="noreferrer" href="{h(soc_map[k])}"><b>{h(lbl)}</b></a>'
+        for k, lbl, _d in PLATFORMS if k in soc_map)
+    soc_chips += "".join(
+        f'<a class="chip" target="_blank" rel="noreferrer" href="{h(u)}"><b>{h(urlparse(u).hostname or "Link")}</b></a>'
+        for u in (safe_url(x) for x in soc_other) if u)
+    category_values = c.get("categories", [])
+    category_text = ", ".join(category_values) if isinstance(category_values, list) else str(category_values or "")
+    web_labels = {k: v[0] for k, v in WEB_LABEL.items()}
+    stage_labels = dict(STAGE_LABEL)
+    retainer_options = "".join(f'<option value="{h(x.get("name"))}">' for x in p["retainers"])
+
+    history_html = []
+    for item in histories:
+        pdf_link = (f'<a class="btn sm" href="/pdf/{item["id"]}">Download PDF</a>'
+                    if item.get("pdf_path") and Path(item["pdf_path"]).is_file() else '<span class="pill warn">PDF missing</span>')
+        scope_rows = []
+        for step in item.get("scope_items", []):
+            scope_rows.append(
+                f'<form class="scope" method="post" action="/scope/{item["id"]}/{quote(step["id"])}"><label>'
+                f'<input type="checkbox" name="done" value="1"{" checked" if step.get("done") else ""} onchange="this.form.submit()"> '
+                f'<b>{h(step["step"])}. {h(step["title"])}</b></label><p>Evidence: {h(step["evidence"])}</p><p>Action: {h(step["action"])}</p></form>')
+        done = sum(bool(x.get("done")) for x in item.get("scope_items", []))
+        total = len(item.get("scope_items", []))
+        history_html.append(
+            f'<div class="history" id="scope-{item["id"]}"><div class="actions"><b>{h(str(item["audit_date"])[:16].replace("T", " "))}</b>'
+            f'<span class="pill info">Score {h(item["score"])}/100</span><span class="pill">{h(item["confidence"])} confidence</span>'
+            f'<span class="pill accent">Quote {money(item["quote_amount"])}</span>{pdf_link}</div>'
+            f'<details open><summary>Scope of Work: {done} of {total} done</summary>{"".join(scope_rows) or "<p class=muted>No action steps were generated.</p>"}</details>'
+            f'<details><summary>Audit results and evidence</summary><pre>{h(json.dumps(item["summary"], indent=2, ensure_ascii=False))}</pre></details></div>')
+
+    audit_disabled = "" if is_verified and website_allowed else "disabled"
+    audit_note = ("This record is verified and has its own website. It is ready to audit." if not audit_disabled
+                  else "To audit, tick the verified box, set the website category to Own website, add the website address and save.")
+    sow_button = (f'<a class="btn block" href="#scope-{histories[0]["id"]}">Open Scope of Work</a>' if histories else '')
+    maps_url = f'https://www.google.com/maps/search/?api=1&query={quote(c["business_name"] + " " + c.get("address", ""))}'
+    site_link = f'<a class="btn sm" target="_blank" rel="noreferrer" href="{h(c["website_url"])}">Visit website</a>' if c.get("website_url") else ""
+    tags = (f'{stage_pill(c.get("pipeline_stage"))}{web_pill(c.get("website_detail"))}'
+            f'<span class="pill {"ok" if is_verified else "warn"}">{"Verified" if is_verified else "Not verified"}</span>'
+            f'<span class="pill {"ok" if c.get("outreach_allowed") else ""}">{"Outreach allowed" if c.get("outreach_allowed") else "Outreach off"}</span>'
+            + ('<span class="pill dark">Not on Maps</span>' if c.get("found_via") == FINDER_SOURCE else ""))
+    loc_bits = [x for x in (c.get("town"), c.get("sector")) if x]
+
+    name_attrs = 'readonly title="The name is fixed once a lead is created"'
+    form = f'''<form method="post" action="/profile/save"><input type="hidden" name="id" value="{c["id"]}">
+<section class="panel"><h2>Business and contact</h2><div class="grid">
+{field("Business name", "business_name", c["business_name"], "text", name_attrs)}{field("Contact first name", "first_name", c["first_name"])}{field("Surname", "surname", c["surname"])}
+{field("Phone", "phone", c["phone"], "tel")}{field("Email", "email", c["email"], "email")}{select_field("Town", "town", TOWNS, c["town"])}
+{field("Address", "address", c["address"])}{field("Sector", "sector", c["sector"])}{field("Google categories", "categories", category_text)}</div></section>
+<section class="panel"><h2>Web presence</h2><div class="grid">
+{field("Official business website", "website_url", c["website_url"], "url")}{select_field("Website category", "website_detail", WEBSITE_DETAILS, c["website_detail"], web_labels)}
+{select_field("Website status", "website_status", WEBSITE_STATUSES, c["website_status"])}
+{field("Google rating", "rating", c["rating"], "number", 'step="0.1"')}{field("Google review count", "review_count", c["review_count"], "number", 'min="0"')}{field("Place ID", "place_id", c["place_id"])}
+{field("Latitude", "latitude", c["latitude"], "number", 'step="any"')}{field("Longitude", "longitude", c["longitude"], "number", 'step="any"')}</div></section>
+{social_panel}
+<section class="panel"><h2>Checks and permission</h2><div class="grid"><div class="checks">
+<label><input type="checkbox" name="details_verified" value="1"{" checked" if is_verified else ""}> I checked these business details and the official website myself</label>
+<label><input type="checkbox" name="outreach_allowed" value="1"{" checked" if c.get("outreach_allowed") else ""}> Outreach is allowed after my checks</label>
+<label><input type="checkbox" name="marketing_consent" value="1"{" checked" if c.get("marketing_consent") else ""}> Marketing consent is recorded</label></div>
+{field("Last contacted", "last_contacted_at", c.get("last_contacted_at"))}{select_field("Lead lifecycle", "lifecycle_status", ["Scraped", "Awaiting_Outreach", "Contacted", "Suppressed"], c.get("lifecycle_status", "Scraped"))}</div></section>
+<section class="panel"><h2>Sales and follow-up</h2><div class="grid">
+{select_field("Pipeline stage", "pipeline_stage", LEAD_STAGES, c.get("pipeline_stage", "new"), stage_labels)}{field("Next follow-up date", "next_follow_up_date", c.get("next_follow_up_date"), "date")}
+{field("One-off quote (R)", "quote_amount", c.get("quote_amount"), "number", 'min="0" step="0.01"')}{select_field("Quote type", "quote_type", QUOTE_TYPES, c.get("quote_type", ""))}
+{field("Monthly fee (R)", "monthly_fee", c.get("monthly_fee"), "number", 'min="0" step="0.01"')}
+<div class="field"><label class="lab">Hosting</label><label style="display:flex;gap:8px;align-items:center;padding:8px 0"><input type="checkbox" name="hosting_enabled" value="1"{" checked" if c.get("hosting_enabled") else ""}> Hosting is active ({money(p["hosting"])} a month)</label></div>
+{field("Retainer", "retainer_name", c.get("retainer_name"), "text", 'list="retainers"')}<datalist id="retainers">{retainer_options}</datalist>{field("Lead status", "lead_status", c.get("lead_status"))}
+<div class="field wide"><label class="lab" for="notes">Notes</label><textarea id="notes" name="notes">{h(c.get("notes"))}</textarea></div></div></section>
+<div class="savebar"><button class="btn primary" type="submit">Save profile</button></div></form>'''
+
+    aside = f'''<aside class="aside"><section class="panel"><h2>Audit and rankings</h2>
+<p class="note">{h(audit_note)}</p>
+<form method="post" action="/audit/{c["id"]}" onsubmit="return confirm('Run one live audit for this verified business now? This crawls the website and creates a PDF.');"><button class="btn primary block" type="submit" {audit_disabled}>Audit Business</button></form>
+{f'<div style="margin-top:8px">{sow_button}</div>' if sow_button else ''}
+<hr class="rule">
+<form class="rank-form" method="post" action="/rank/{c["id"]}" onsubmit="return confirmRank(this);">
+<label class="lab small muted" for="rk_source">Where to check</label>
+<select id="rk_source" name="source"><option value="serpapi">Google (uses about 3 searches)</option><option value="ddgs">Free search (indicative)</option></select>
+<label class="lab small muted" for="rk_kw">Searches to check (optional, separate with semicolons)</label>
+<input id="rk_kw" name="keywords" placeholder="plumber {h(c.get("town") or "your town")}; best plumber {h(c.get("town") or "your town")}">
+<button class="btn dark block" type="submit">Check rankings</button></form>
+{_rank_block(c["id"])}
+</section>
+<section class="panel"><h2>Quick links</h2><div class="actions"><a class="btn sm" target="_blank" rel="noreferrer" href="{h(maps_url)}">Google Maps search</a>{site_link}</div></section></aside>
+<script>function confirmRank(f){{var s=f.source.value;return confirm(s==='serpapi'?'Check where this business ranks on Google? This uses about 3 of your monthly SerpApi searches (fewer if the results are saved from the last 7 days).':'Run the free ranking check? The results are indicative only.');}}</script>'''
+
+    sources = "".join(f'<p><a target="_blank" rel="noreferrer" href="{h(u)}">{h(u)}</a></p>' for u in c.get("source_urls", [])) or '<p class="muted">No source links saved.</p>'
+    meta_line = " &middot; ".join(h(x) for x in loc_bits)
+    body = f'''<div class="crumb"><a href="/">Leads</a> / {h(c["business_name"])}</div>{banner}
+<div class="phead">{avatar(c["business_name"], True)}<div class="who"><h1>{h(c["business_name"])}</h1><div class="muted">{meta_line}</div><div class="tags">{tags}</div>{f'<div class="chips" style="margin:10px 0 0">{soc_chips}</div>' if soc_chips else ''}</div></div>
+<div class="profile"><div>{form}
+<section class="panel"><div class="panel-head"><h2>Audit history</h2><span>{len(histories)} on record</span></div>{"".join(history_html) or '<p class="muted">No audits yet. Verify the business and run one from the panel on the right.</p>'}</section>
+<section class="panel src-links"><h2>Source links</h2>{sources}</section></div>{aside}</div>'''
+    return layout(c["business_name"], body, "leads", message, refresh), refresh
+
+
+# ---------------------------------------------------------------- not listed
+
+def _lead_key(name: str) -> str:
+    return hashlib.sha1(re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip().encode("utf-8")).hexdigest()[:12]
+
+
+def _dismissed() -> set:
+    try:
+        return set(json.loads((FINDER_DIR / "dismissed.json").read_text(encoding="utf-8")))
+    except Exception:
+        return set()
+
+
+def _save_dismissed(keys: set) -> None:
+    FINDER_DIR.mkdir(parents=True, exist_ok=True)
+    (FINDER_DIR / "dismissed.json").write_text(json.dumps(sorted(keys)), encoding="utf-8")
+
+
+def finder_leads() -> list[dict]:
+    """Leads from every finder run that are not dismissed and not already in the CRM."""
+    try:
+        import find_unlisted as finder
+    except Exception:
+        return []
+    crm = finder.load_crm(db_path(), tenant_id())
+    skip = _dismissed()
+    seen, out = set(), []
+    try:
+        files = sorted(FINDER_DIR.glob("finder-*.json"), reverse=True)
+    except Exception:
+        files = []
+    for path in files:
+        try:
+            leads = json.loads(path.read_text(encoding="utf-8")).get("leads", [])
+        except Exception:
+            continue
+        for lead in leads:
+            key = _lead_key(lead.get("business_name"))
+            if key in seen or key in skip:
+                continue
+            seen.add(key)
+            urls = [u.strip() for u in str(lead.get("listing_url", "")).split("|") if u.strip()]
+            probe = dict(lead)
+            probe["listing_url"] = next((u for u in urls if finder.source_type(u) == "facebook"), urls[0] if urls else "")
+            probe["source_type"] = "facebook" if any(finder.source_type(u) == "facebook" for u in urls) else "directory"
+            if finder.already_in_crm(probe, crm):
+                continue
+            out.append({**lead, "key": key, "urls": urls})
+    return out
+
+
+def _source_label(url: str) -> str:
+    host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    if host.endswith("facebook.com"):
+        return "Facebook"
+    return host.split(".")[0].capitalize() if host else "Link"
+
+
+def not_listed_page(message: str = "") -> bytes:
+    job = dict(FINDER_JOB)
+    refresh = 4 if job["state"] == "running" else 0
+    if job["state"] == "running":
+        lines = "<br>".join(h(x) for x in job["lines"][-8:])
+        job_html = (f'<div class="banner"><span class="job"><span class="dot"></span><span>Searching {h(job["town"])}. This takes a couple of minutes and the page refreshes by itself.</span></span></div>'
+                    f'<div class="log">{lines}</div>')
+    elif job["state"] == "done":
+        job_html = f'<div class="banner">{h(job["summary"])}</div>'
+    elif job["state"] == "error":
+        job_html = f'<div class="banner bad">The search stopped: {h(job["error"])}</div>'
+    else:
+        job_html = ""
+
+    leads = finder_leads()
+    rows = []
+    for lead in leads:
+        srcs = "".join(f'<a class="pill {"info" if _source_label(u) == "Facebook" else ""}" target="_blank" rel="noreferrer" href="{h(u)}">{h(_source_label(u))}</a>' for u in lead["urls"])
+        conf = lead.get("confidence", "low")
+        cls = {"high": "ok", "medium": "info"}.get(conf, "")
+        rows.append(
+            f'<tr><td><input type="checkbox" name="pick" value="{h(lead["key"])}" aria-label="Select {h(lead.get("business_name"))}"></td>'
+            f'<td><div class="biz">{avatar(lead.get("business_name", ""))}<div><b>{h(lead.get("business_name"))}</b>'
+            f'<div class="muted small">{h(str(lead.get("snippet", ""))[:110])}</div></div></div></td>'
+            f'<td>{h(lead.get("trade"))}</td><td><div class="srcs">{srcs}</div></td>'
+            f'<td>{h(lead.get("phone")) or "<span class=muted>None found</span>"}</td><td><span class="pill {cls}">{h(conf.title())} match</span></td></tr>')
+    if rows:
+        review = (f'<form method="post" action="/finder/add"><div class="actions" style="margin-bottom:10px">'
+                  f'<button class="btn primary" type="submit">Add selected to CRM</button>'
+                  f'<button class="btn" type="submit" formaction="/finder/dismiss" onclick="return confirm(\'Dismiss the selected leads? They will stop showing here.\');">Dismiss selected</button></div>'
+                  f'<div class="tbl-wrap"><table><thead><tr><th><input type="checkbox" data-all aria-label="Select all"></th><th>Business</th><th>Trade</th><th>Found on</th><th>Phone</th><th>Match</th></tr></thead>'
+                  f'<tbody>{"".join(rows)}</tbody></table></div></form>')
+    else:
+        review = '<div class="empty">Nothing to review yet. Enter a town above to search Facebook and business directories.</div>'
+
+    body = f'''<div class="head"><div><h1>Not listed</h1>
+<p>Businesses that show up on Facebook or in directories but may have no Google Maps listing. They are often the easiest to help.</p></div></div>
+{job_html}
+<section class="panel"><h2>Find businesses</h2>
+<p class="note">This searches the web for Facebook pages and directory entries. It does not use your SerpApi searches. Leads you add start with outreach off and details not verified.</p>
+<form class="filters" method="post" action="/finder/run" onsubmit="return confirm('Search for businesses in this town? It takes a couple of minutes and uses none of your SerpApi searches.');">
+<input name="town" required placeholder="Town, for example Port Alfred" aria-label="Town"><input name="trades" placeholder="Trades, optional: plumber, electrician" aria-label="Trades">
+<button class="btn dark" type="submit"{" disabled" if job["state"] == "running" else ""}>Find businesses</button></form></section>
+<section class="panel"><div class="panel-head"><h2>To review</h2><span>{len(leads)} lead{"s" if len(leads) != 1 else ""}</span></div>
+<p class="note">Open each link and check the page is a real, active business in your area before you add it. Direct marketing is covered by POPIA, so offer an opt-out when you make contact.</p>{review}</section>'''
+    return layout("Not listed", body, "notlisted", message, refresh)
+
+
+def _finder_worker(town: str, trades: list[str]) -> None:
+    job = FINDER_JOB
+    def progress(msg):
+        job["lines"].append(str(msg))
+        del job["lines"][:-40]
+    try:
+        import find_unlisted as finder
+        res = finder.run_finder(town, trades, db=db_path(), tenant=tenant_id(), progress=progress)
+        job["summary"] = f"Search finished for {town}. {len(res['leads'])} new to review, {res['skipped']} already in your CRM."
+        if res["errors"] and not res["leads"]:
+            job["state"], job["error"] = "error", res["errors"][0][:240]
+        else:
+            job["state"] = "done"
+    except Exception as exc:
+        job["state"], job["error"] = "error", f"{type(exc).__name__}: {exc}"
+
+
+def start_finder(town: str, trades: list[str]) -> str:
+    with FINDER_LOCK:
+        if FINDER_JOB["state"] == "running":
+            return "A search is already running. Wait for it to finish."
+        FINDER_JOB.update({"state": "running", "town": town, "lines": [], "summary": "", "error": ""})
+    threading.Thread(target=_finder_worker, args=(town, trades), daemon=True, name="finder").start()
+    return f"Search started for {town}."
+
+
+def lead_to_payload(lead: dict) -> dict:
+    try:
+        import find_unlisted as finder
+        has_fb = any(finder.source_type(u) == "facebook" for u in lead["urls"])
+    except Exception:
+        has_fb = any("facebook.com" in u for u in lead["urls"])
+    return {"town": lead.get("town", ""), "leads": [{
+        "business_name": lead.get("business_name", ""), "sector": lead.get("trade", ""), "categories": [],
+        "website_status": "no_website_surfaced_in_search",
+        "website_detail": "social_page_only" if has_fb else "directory_page_only", "website_url": "",
+        "directory_or_profile_sources": lead["urls"], "phone": lead.get("phone", ""), "address": "",
+        "rating": None, "review_count": None, "latitude": None, "longitude": None, "place_id": "",
+        "towns_found": [lead.get("town", "")], "found_via": FINDER_SOURCE}]}
+
+
+# ---------------------------------------------------------------- other pages
+
+def sweep_plan_page(town: str, max_searches: int, server) -> bytes:
+    from town_sweep import DEFAULT_TRADES, cache_get
+    plan = []
+    for trade in DEFAULT_TRADES:
+        cached = cache_get(f"{trade}|{town}|0".lower()) is not None
+        plan.append({"trade": trade, "cached": cached, "quota_units": 0 if cached else 1})
+    units = sum(x["quota_units"] for x in plan)
+    planned = min(units, max_searches)
+    token = uuid.uuid4().hex
+    server.sweep_plans[token] = {"town": town, "max_searches": max_searches, "planned_units": planned}
+    trs = "".join(f'<tr><td>{h(x["trade"])}</td><td>{"Saved, free" if x["cached"] else "New search"}</td><td>{x["quota_units"]}</td></tr>' for x in plan)
+    body = f'''<div class="head"><div><h1>Plan for {h(town)}</h1><p>No searches have been made. About {planned} of your monthly SerpApi searches would be used.</p></div></div>
+<section class="panel"><div class="tbl-wrap"><table><thead><tr><th>Trade</th><th>Source</th><th>Searches</th></tr></thead><tbody>{trs}</tbody></table></div>
+<form method="post" action="/sweep/run" class="actions" style="margin-top:14px"><input type="hidden" name="token" value="{token}">
+<button class="btn primary" type="submit">Confirm and run {planned} search{"es" if planned != 1 else ""}</button><a class="btn" href="/">Cancel</a></form></section>'''
+    return layout("Plan search", body, "leads")
+
+
+def suppression_page(message: str = "") -> bytes:
+    tenant = tenant_id()
+    with tenant_context(tenant):
+        with connect(db_path()) as conn:
+            rows = conn.execute("select identity_type,reason,created_at from suppression_list where tenant_id=? order by created_at desc", (tenant,)).fetchall()
+    listing = "".join(f'<tr><td>{h(r["identity_type"])}</td><td>{h(r["reason"]) or "<span class=muted>No reason saved</span>"}</td><td>{h(r["created_at"])}</td></tr>' for r in rows)
+    body = f'''<div class="head"><div><h1>Do not contact</h1><p>Anyone added here is skipped when leads are imported. Add an email, a phone number or a Google place ID.</p></div></div>
+<section class="panel"><form class="filters" method="post" action="/suppression/add"><select name="kind" aria-label="Type"><option value="email">Email</option><option value="phone">Phone</option><option value="place_id">Place ID</option></select>
+<input name="value" required placeholder="Email, phone or place ID" aria-label="Value"><input name="reason" placeholder="Reason, optional" aria-label="Reason"><button class="btn dark" type="submit">Add to list</button></form></section>
+<div class="tbl-wrap"><table style="min-width:0"><thead><tr><th>Type</th><th>Reason</th><th>Added</th></tr></thead><tbody>{listing or '<tr><td colspan="3"><div class="empty">Nobody is on the list yet.</div></td></tr>'}</tbody></table></div>'''
+    return layout("Do not contact", body, "suppression", message)
+
+
+# ---------------------------------------------------------------- server
+
+def _redirect(self, location: str):
+    self.send_response(303)
+    self.send_header("Location", location)
+    self.end_headers()
+
+
+def _read_form(self) -> dict:
+    size = min(int(self.headers.get("Content-Length", "0") or 0), 200_000)
+    return parse_qs(self.rfile.read(size).decode("utf-8", "replace"), keep_blank_values=True)
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "StraightUpCRM/3.0"
+
+    def log_message(self, fmt, *args):
+        print("CRM:", fmt % args)
+
+    def send_body(self, status, body, content_type="text/html; charset=utf-8"):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        q = parse_qs(parsed.query)
+        params = {k: v[-1] for k, v in q.items()}
+        path = parsed.path
+        if path == "/":
+            return self.send_body(200, main_page(params, params.get("message", "")))
+        if path == "/health":
+            return self.send_body(200, b'{"status":"ok"}', "application/json; charset=utf-8")
+        if path == "/not-listed":
+            return self.send_body(200, not_listed_page(params.get("message", "")))
+        if path == "/job-status":
+            from audit_queue import job_status
+            job = job_status(params.get("job_id", ""), tenant_id(), db_path())
+            if not job:
+                return self.send_body(404, b'{"error":"job not found"}', "application/json; charset=utf-8")
+            return self.send_body(200, json.dumps(job).encode("utf-8"), "application/json; charset=utf-8")
+        if path == "/sweep/plan":
+            town = params.get("town", "").strip()
+            if not town:
+                return self.send_body(400, b"Town required", "text/plain; charset=utf-8")
+            try:
+                max_searches = max(1, min(50, int(params.get("max_searches", "12"))))
+            except ValueError:
+                max_searches = 12
+            return self.send_body(200, sweep_plan_page(town, max_searches, self.server))
+        if path == "/suppression":
+            return self.send_body(200, suppression_page(params.get("message", "")))
+        if path == "/brand-logo":
+            logo = Path(config().get("crm_logo_path", str(LOCKUP)))
+            if logo.is_file():
+                return self.send_body(200, logo.read_bytes(), "image/png")
+            return self.send_body(404, b"Logo not found", "text/plain; charset=utf-8")
+        if path.startswith("/contact/"):
+            try:
+                body, _refresh = profile_page(int(path.rsplit("/", 1)[1]), params.get("message", ""))
+                return self.send_body(200 if body != b"Customer not found" else 404, body)
+            except ValueError:
+                return self.send_body(400, b"Invalid contact id", "text/plain; charset=utf-8")
+        if path.startswith("/pdf/"):
+            try:
+                hid = int(path.rsplit("/", 1)[1])
+                with connect(db_path()) as conn:
+                    row = conn.execute(
+                        "SELECT pdf_path FROM audit_history WHERE id=? AND tenant_id=?",
+                        (hid, tenant_id()),
+                    ).fetchone()
+                pdf = Path(row["pdf_path"]).resolve() if row else None
+                reports = (PROJECT_DIR / "reports").resolve()
+                if pdf and pdf.is_relative_to(reports) and pdf.is_file():
+                    return self.send_body(200, pdf.read_bytes(), "application/pdf")
+                return self.send_body(404, b"PDF not found", "text/plain; charset=utf-8")
+            except (ValueError, OSError):
+                return self.send_body(400, b"Invalid report id", "text/plain; charset=utf-8")
+        if path == "/export.csv":
+            rows = list_contacts(db_path(), website_status=params.get("website_status", ""), town=params.get("town", ""),
+                                 website_detail=params.get("website_detail", ""), stage=params.get("stage", ""),
+                                 outreach_allowed=int(params["outreach_allowed"]) if params.get("outreach_allowed") in ("0", "1") else None,
+                                 tenant_id=tenant_id(), limit=5000)
+            buff = io.StringIO(newline="")
+            fields = list(rows[0].keys()) if rows else ["id", "business_name", "phone", "address", "town", "website_url", "website_detail"]
+            w = csv.DictWriter(buff, fieldnames=fields)
+            w.writeheader()
+            for row in rows:
+                w.writerow({k: json.dumps(v, ensure_ascii=False) if isinstance(v, list) else v for k, v in row.items()})
+            return self.send_body(200, buff.getvalue().encode("utf-8-sig"), "text/csv; charset=utf-8")
+        return self.send_body(404, b"Not found", "text/plain; charset=utf-8")
+
+    def do_POST(self):
+        if self.client_address[0] not in ("127.0.0.1", "::1"):
+            return self.send_body(403, b"Local only", "text/plain; charset=utf-8")
+        origin = self.headers.get("Origin")
+        if origin and origin != "null" and (urlparse(origin).hostname or "") not in ("127.0.0.1", "localhost", "::1"):
+            return self.send_body(403, b"Blocked: this request came from another website", "text/plain; charset=utf-8")
+        form = _read_form(self)
+        data = {k: v[-1].strip() for k, v in form.items()}
+        path = urlparse(self.path).path
+        tenant = tenant_id()
+
+        if path.startswith("/scope/"):
+            try:
+                parts = path.strip("/").split("/")
+                hid, item_id = int(parts[1]), parts[2]
+                update_scope_item(hid, item_id, data.get("done") == "1", db_path())
+                with connect(db_path()) as conn:
+                    row = conn.execute("SELECT contact_id FROM audit_history WHERE id=?", (hid,)).fetchone()
+                if not row:
+                    return self.send_body(404, b"Audit history missing", "text/plain; charset=utf-8")
+                return _redirect(self, f"/contact/{row['contact_id']}?message=Scope+item+saved")
+            except Exception as exc:
+                return self.send_body(400, h(exc).encode(), "text/plain; charset=utf-8")
+
+        if path == "/suppression/add":
+            try:
+                kind = data.get("kind", "").lower()
+                value = data.get("value", "")
+                if kind not in ("email", "phone", "place_id") or not value:
+                    return self.send_body(400, b"Valid suppression type and value required", "text/plain; charset=utf-8")
+                with tenant_context(env("CRM_TENANT_ID")):
+                    with connect(db_path()) as conn:
+                        add_suppression(conn, kind, value, data.get("reason", ""))
+                return _redirect(self, "/suppression?message=Added+to+the+do+not+contact+list")
+            except Exception as exc:
+                return self.send_body(400, h(exc).encode(), "text/plain; charset=utf-8")
+
+        if path == "/sweep/run":
+            plan = self.server.sweep_plans.pop(data.get("token", ""), None)
+            if not plan:
+                return self.send_body(400, b"Search confirmation expired or missing", "text/plain; charset=utf-8")
+            job_ids = []
+            try:
+                from town_sweep import DEFAULT_TRADES, run_sweep
+                from sweep_queue import enqueue_trades, update_job
+                with tenant_context(tenant):
+                    with connect(db_path()) as conn:
+                        job_ids = enqueue_trades(conn, tenant, plan["town"], DEFAULT_TRADES, plan)
+                    result = run_sweep(plan["town"], DEFAULT_TRADES, plan["max_searches"], 1, False, False, progress=print)
+                    from sweep_compliance import import_sweep_payload
+                    imported = import_sweep_payload(result, db_path(), tenant)
+                    for jid in job_ids:
+                        with connect(db_path()) as conn:
+                            update_job(conn, jid, "completed", result_path=result.get("paths", {}).get("json_path", ""), tenant_id=tenant)
+                return _redirect(self, "/?message=" + quote(f"Search complete: {imported.get('processed', 0)} imported, {imported.get('suppression_skipped', 0)} skipped as do not contact"))
+            except BaseException as exc:
+                print("Confirmed city sweep failed:", type(exc).__name__, str(exc))
+                for jid in job_ids:
+                    try:
+                        from sweep_queue import update_job
+                        with connect(db_path()) as conn:
+                            update_job(conn, jid, "failed", f"{type(exc).__name__}: {exc}", tenant_id=tenant)
+                    except Exception:
+                        pass
+                if isinstance(exc, (KeyboardInterrupt,)):
+                    raise
+                return _redirect(self, "/?message=" + quote(f"Search failed: {exc}"[:200]))
+
+        if path == "/finder/run":
+            town = data.get("town", "")
+            if not town:
+                return _redirect(self, "/not-listed?message=Enter+a+town+first")
+            trades = [t.strip() for t in data.get("trades", "").split(",") if t.strip()]
+            return _redirect(self, "/not-listed?message=" + quote(start_finder(town, trades)))
+
+        if path in ("/finder/add", "/finder/dismiss"):
+            picks = [k for k in form.get("pick", []) if k]
+            if not picks:
+                return _redirect(self, "/not-listed?message=Select+at+least+one+lead+first")
+            available = {x["key"]: x for x in finder_leads()}
+            if path == "/finder/dismiss":
+                _save_dismissed(_dismissed() | {k for k in picks if k in available})
+                return _redirect(self, "/not-listed?message=" + quote(f"Dismissed {len([k for k in picks if k in available])} lead(s)"))
+            added = skipped = failed = 0
+            last_error = ""
+            for key in picks:
+                lead = available.get(key)
+                if not lead:
+                    continue
+                try:
+                    from sweep_compliance import import_sweep_payload
+                    with tenant_context(tenant):
+                        res = import_sweep_payload(lead_to_payload(lead), db_path(), tenant)
+                    if res.get("processed", 0):
+                        added += 1
+                    else:
+                        skipped += 1
+                except Exception as exc:
+                    failed += 1
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    print("Add from Not listed failed:", last_error)
+            msg = f"Added {added} to the CRM."
+            if skipped:
+                msg += f" {skipped} skipped (do not contact list or already saved)."
+            if failed:
+                msg += f" {failed} failed: {last_error[:120]}"
+            return _redirect(self, "/not-listed?message=" + quote(msg))
+
+        if path.startswith("/rank/"):
+            try:
+                cid = int(path.rsplit("/", 1)[1])
+            except ValueError:
+                return self.send_body(400, b"Invalid contact id", "text/plain; charset=utf-8")
+            if not get_contact(cid, db_path(), tenant):
+                return self.send_body(404, b"Contact not found", "text/plain; charset=utf-8")
+            if not RANK_LOCK.acquire(blocking=False):
+                return _redirect(self, f"/contact/{cid}?message=A+ranking+check+is+already+running")
+            try:
+                import rank_check as rc
+                business = (rc.load_contacts([cid], db_path(), tenant) or [None])[0]
+                if not business:
+                    return _redirect(self, f"/contact/{cid}?message=Contact+not+found")
+                source = "ddgs" if data.get("source") == "ddgs" else "serpapi"
+                keywords = [k.strip() for k in data.get("keywords", "").split(";") if k.strip()][:5]
+                result = rc.run_for_business(business, keywords or None, source=source)
+                ranked = sum(1 for r in result["results"] if r["position"])
+                msg = f"Ranking check done. Showed up for {ranked} of {len(result['results'])} searches."
+                if result["errors"]:
+                    msg += f" Some searches failed: {result['errors'][0][:100]}"
+                return _redirect(self, f"/contact/{cid}?message=" + quote(msg))
+            except Exception as exc:
+                return _redirect(self, f"/contact/{cid}?message=" + quote(f"Ranking check failed: {exc}"[:220]))
+            finally:
+                RANK_LOCK.release()
+
+        if path == "/profile/save":
+            try:
+                cid = int(data.get("id", "0"))
+                current = get_contact(cid, db_path(), tenant)
+                if not current:
+                    return self.send_body(404, b"Contact not found", "text/plain; charset=utf-8")
+                socials, seen = [], set()
+                for raw in [data.get(f"social_{k}", "") for k, _l, _d in PLATFORMS] + data.get("social_other", "").splitlines():
+                    u = safe_url(raw)
+                    if u and u.lower().rstrip("/") not in seen:
+                        seen.add(u.lower().rstrip("/"))
+                        socials.append(u)
+                data["social_links"] = socials
+                data["categories"] = [x.strip() for x in data.get("categories", "").split(",") if x.strip()]
+                save_contact_fields(cid, data, db_path(), tenant)
+                return _redirect(self, f"/contact/{cid}?message=Profile+saved")
+            except Exception as exc:
+                return self.send_body(400, h(exc).encode(), "text/plain; charset=utf-8")
+
+        if path.startswith("/audit/"):
+            try:
+                cid = int(path.rsplit("/", 1)[1])
+            except ValueError:
+                return self.send_body(400, b"Invalid contact id", "text/plain; charset=utf-8")
+            try:
+                c = get_contact(cid, db_path(), tenant)
+                if not c:
+                    return self.send_body(404, b"Contact not found", "text/plain; charset=utf-8")
+                if not c.get("details_verified"):
+                    return _redirect(self, f"/contact/{cid}?message=Verify+business+details+before+audit")
+                if c.get("website_detail") != "own_website_listed" or not c.get("website_url"):
+                    return _redirect(self, f"/contact/{cid}?message=Official+website+required")
+                from audit_queue import enqueue_audit
+                job_id = enqueue_audit(cid, tenant, db_path())
+                return _redirect(self, f"/contact/{cid}?message=Audit+queued+job+{job_id}")
+            except Exception as exc:
+                return _redirect(self, f"/contact/{cid}?message={quote(type(exc).__name__ + ': ' + str(exc))}")
+        return self.send_body(404, b"Not found", "text/plain; charset=utf-8")
+
+
+def main():
+    load_env()
+    tenant = tenant_id()
+    migrate(db_path(), tenant)
+    with tenant_context(tenant):
+        with connect(db_path()):
+            pass
+    from audit_queue import recover_queued
+    recovered = recover_queued(tenant, db_path())
+    print(f"Recovered queued audit jobs: {recovered}")
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    server.sweep_plans = {}
+    print(f"Straight Up Digital CRM at http://{HOST}:{PORT}/")
+    print(f"SQLite: {DEFAULT_DB}")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
