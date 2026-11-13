@@ -1,0 +1,526 @@
+STRAIGHT UP DIGITAL
+WEB DEVELOPER HANDOVER
+Prepared: 13 November 2026
+
+===============================================================================
+1. PURPOSE AND CURRENT STATE
+===============================================================================
+
+This handover is for the developer building the Straight Up Digital public
+website and deciding how the existing CRM/auditing tool should fit into the
+online service.
+
+Git repository:
+https://github.com/stjohntoperformer-sudo/Staightupdigital
+
+Current branch: master
+Latest repository commit: 684b9ca (Use replacement logo asset archive)
+
+Important: the repository currently contains a local-first Python application.
+It is not currently a finished marketing website or a production-hosted CRM.
+The current CRM is a server-rendered local web interface backed by SQLite and
+local files. There is no confirmed package.json, Netlify configuration, public
+site frontend, production API, or production authentication setup in the
+repository at handover time.
+
+Build the public marketing website as a separate, deployable frontend. Do not
+assume the Python CRM can be deployed unchanged to Netlify. Keep the CRM private
+until its hosting, authentication, database, file storage, and privacy controls
+are deliberately made production-ready.
+
+This file describes observed source-code defaults and behavior. It does not
+confirm current commercial terms, contact details, service-area commitments,
+or that every software feature is ready to sell. Obtain owner approval before
+publishing any such claim.
+
+===============================================================================
+2. BUSINESS AND BRAND
+===============================================================================
+
+Business name in the code and asset archive:
+Straight Up Digital
+
+Brand colors used in the existing CRM and audit template:
+- Near-black: #101114 (some source defaults use #101010)
+- Orange accent: #F04A0A
+- White/light backgrounds with dark text
+
+Logo assets:
+- The repository includes:
+  Straight Up Digital/straight-up-digital-logo-pngs.zip
+- The archive contains horizontal and stacked lockups, dark/light SVGs, PNG
+  variants, wordmarks, symbol-only variants, app icon, favicon files, and a
+  brand-guidelines PDF.
+- Inspect the supplied brand guidelines before designing. Extract only the
+  logo variants needed into the website's public asset directory.
+- The CRM/PDF source contains machine-specific logo path defaults. Replace
+  those with deployment-safe relative configuration when the CRM is prepared
+  for hosting; do not reproduce the developer's local Windows paths in the
+  website.
+
+Audience suggested by the current product code:
+- Small and local businesses that need a clear website and stronger digital
+  presence.
+- South African local businesses are implied by ZAR pricing, Google South
+  Africa search settings, and default research towns in the source.
+- Port Alfred, Kenton-on-Sea, Bathurst, Alexandria, and Grahamstown appear as
+  application defaults. They are not confirmed contractual service areas;
+  ask the owner before publishing location coverage.
+
+No verified public website domain, business email, telephone number, postal
+address, social profile URLs, or owner-approved service-area list was found in
+the tracked application materials reviewed for this handover. Do not invent
+these. Request approved details from the owner.
+
+===============================================================================
+3. SERVICES TO PRESENT FOR OWNER APPROVAL
+===============================================================================
+
+The application suggests the following service categories. Treat these as
+candidate website copy, not a final approved catalogue:
+
+A. Website design and development
+   - A small/basic website build is represented in code as a once-off offer.
+   - Existing audit recommendations cover service pages, location pages,
+     navigation, enquiry paths, contact details, structured data, and content.
+   - Confirm platform, number of pages, copywriting, imagery, revisions,
+     domain, email, hosting, support, maintenance, and exclusions before
+     promising a package.
+
+B. Website and digital-presence audits
+   - The existing engine crawls a public business website and prepares an
+     evidence-based report on observable website and local-presence signals.
+   - It can produce an executive summary, scorecard, improvement opportunities,
+     confidence/coverage notes, strategy, content briefs, competitor
+     observations, sales brief, and PDF.
+   - The audit is directional, not a guarantee or a substitute for analytics,
+     Lighthouse/PageSpeed, accessibility, backlink, legal, or security audits.
+
+C. Website improvement and on-page SEO
+   - Potential work suggested by the audit: page titles and meta descriptions,
+     heading structure, alt text, content clarity, internal links, service
+     pages, contact/enquiry paths, and LocalBusiness/Organization structured
+     data.
+   - Search volume, traffic, ranking, conversion, or revenue results are not
+     measured by the core audit. Do not promise rankings or leads.
+
+D. Local search and Google Business Profile support
+   - The tools can look up public listing candidates and identify basic
+     profile details when supported by a configured provider.
+   - Exact listing identity, ownership, completeness, and ongoing performance
+     still require manual verification. Do not imply that the application
+     manages or is affiliated with Google.
+
+E. Content and social support
+   - Code defaults include content ideas, article/service-page briefs, social
+     post drafts/prompts, FAQ ideas, and monthly action lists.
+   - Verify whether the business actually provides writing, posting,
+     moderation, account management, or only recommendations before describing
+     this as a service.
+
+F. Reputation/review checks
+   - The application can surface candidates for manual review and can use
+     verified Google listing data where available.
+   - HelloPeter, Trustpilot, and other review figures must be checked against
+     the exact business listing. Do not claim automated review monitoring.
+
+Suggested public-site pages:
+- Home
+- Services, with individual service detail pages where useful
+- How it works / audit process
+- About
+- Work or case studies (only real, approved examples)
+- Pricing/packages (only owner-approved prices and scope)
+- Contact / request a quote
+- Privacy notice and terms
+
+Suggested calls to action:
+- Request a website review
+- Request an audit
+- Get a quote / Book a consultation
+
+Do not fabricate testimonials, client logos, case studies, ratings, years in
+business, performance statistics, guarantees, or certifications. The owner
+must supply and approve all such proof.
+
+===============================================================================
+4. PRICING DEFAULTS FOUND IN SOURCE CODE - NOT APPROVED WEBSITE PRICING
+===============================================================================
+
+The following are defaults embedded in business_auditor.py and CRM pricing
+logic. They may be stale, internal examples, or overridden by a local
+auditor_config.json that is intentionally not tracked. Confirm every figure,
+currency, deliverable, tax treatment, and exclusion with the owner before
+publishing.
+
+Code-default one-off pricing:
+- Basic website build: R1,500 once off, described in code as up to 5 pages.
+- Hosting: R99 per month.
+- Audit-fix estimate: R40 per missing assessed score point.
+- Small text change: R150.
+- New page: R650.
+- Photo swap: R150.
+- Extra form: R350.
+- Hourly rate default: R650, with a 2-hour minimum for some estimates.
+
+Code-default monthly retainers:
+- Fresh Start - R200/month:
+  one monthly content idea; monthly listing/contact-detail check; short
+  progress note.
+- Steady Presence - R400/month:
+  two social/content ideas; one profile or review-response check; monthly
+  action list.
+- Local Growth - R700/month:
+  one short website update or FAQ; two social-post drafts; local-profile and
+  review check; monthly progress note.
+- Content Partner - R1,000/month:
+  two website content updates or one article brief; four social-post drafts;
+  monthly SEO/profile check; monthly priorities call or written review.
+- Digital Partner - R1,500/month:
+  four agreed content updates or briefs; weekly social-content prompts;
+  monthly website/local-profile/review checks; performance and next-step
+  report.
+
+These are not binding quotes. The audit code itself says retainers are optional,
+deliverables should be agreed in writing, and larger work should be quoted
+after discussion and scope. Publish no price list until the owner signs off.
+
+===============================================================================
+5. WHAT THE EXISTING APPLICATION DOES
+===============================================================================
+
+CRM and contact management:
+- Server-rendered browser UI for a local lead/client CRM.
+- Contact records include business/contact details, website and social links,
+  sector, location/town, source URLs, notes, website status, Google listing
+  fields, verification flags, outreach/consent fields, lifecycle, pipeline,
+  quote, retainer, hosting, and follow-up date.
+- Lead pipeline stages: new, contacted, quoted, accepted, live, lost.
+- Lead filters/search, follow-up queue, pipeline counts, recurring-income
+  display, and CSV export.
+- Profile page with notes, contact channels, source links, verification and
+  consent controls, quotation details, hosting/retainer fields, and audit
+  history.
+- Do-not-contact suppression list uses tenant-scoped hashes for email, phone,
+  and Google Place ID matching in the import flow.
+- "Not listed" lead finder searches public Facebook/directory pages for leads
+  that may not appear in Google Maps; results need human review.
+
+Business website audit:
+- Crawls up to 20 accessible same-domain pages in the full audit, subject to
+  robots.txt and successful public access.
+- Collects page titles, meta descriptions, headings, links, text, social
+  profiles, selected business signals, robots.txt/sitemap/llms.txt signals,
+  and suspected JavaScript-rendering issues.
+- Scorecard categories: website structure, Google Business Profile, linked
+  social profiles, content coverage, reputation, and business identity.
+- Unverified categories are excluded from the assessed score rather than
+  silently counted as zero. Reports expose coverage and confidence limitations.
+- Searches for public business/review/competitor candidates; may crawl up to
+  three competitor sites with a small page limit.
+- Produces ordered recommendations and draft service/location/FAQ content
+  briefs. Search demand and rankings are not measured by this analysis.
+- Can generate a PDF report using ReportLab and a configurable brand template.
+
+Search and lead research:
+- SerpApi-backed Google/Google Maps lookups and ranking checks, with local
+  cache/budget controls.
+- Live cache-miss lookups reserve a monthly budget slot atomically; cache hits
+  use no slot. A reserved slot remains consumed if the lookup fails.
+- Town sweeps reserve their per-town and total daily limits before each live
+  search; cache hits use no slot, and failed attempts keep their reservation.
+- Optional Google Places API lookup when a Places API key is configured.
+- DDGS-based free search paths for indicative search and unlisted businesses;
+  this route is unofficial and can be rate-limited.
+- OpenStreetMap/Overpass can supplement certain town sweeps.
+- A town sweep can classify leads by whether search surfaced an apparent
+  business-owned website, a social page, a directory page, or no website.
+  Search absence is not proof that a business has no website.
+- Ranking results are a point-in-time search observation, not guaranteed
+  rankings or a universal/personalized position.
+
+Audit queue:
+- CRM audits are queued in SQLite and run through a single background worker.
+- Audit jobs are tenant-scoped and can be recovered/requeued after startup.
+- Audits require a verified contact and a business-owned website.
+- Audit status and PDF/audit history appear on the contact profile.
+
+===============================================================================
+6. TECHNICAL ARCHITECTURE AND FILE MAP
+===============================================================================
+
+- crm_web.py
+  Local HTTP server and server-rendered CRM UI. Uses Python
+  http.server.ThreadingHTTPServer. Default bind is 127.0.0.1; default port is
+  8765. It is not a production web framework/API.
+
+- crm.py
+  SQLite connection/schema and contact, audit-history, scope, import/list,
+  and CSV operations.
+
+- security.py
+  Tenant context, AES-GCM text-encryption helpers, suppression HMAC helper,
+  and bounded retry helper. The presence of encryption helpers does not prove
+  all CRM PII is encrypted in the current write/read paths.
+
+- security_schema.py
+  Additive schema migration helpers and tables for tenant IDs, suppression,
+  audit/sweep jobs, and API usage. It does not drop existing tables.
+
+- audit_queue.py / sweep_queue.py
+  Background audit/sweep queue functionality.
+
+- business_auditor.py
+  Main, fuller audit engine and MCP tool server. CRM audit jobs import its
+  run_audit(), PDF, and pricing functions. It also exposes audit/sweep
+  operations through MCP when run in serve mode.
+
+- town_sweep.py / find_unlisted.py / rank_check.py
+  Separate lead discovery, sweep, and search-rank utilities.
+
+- storage.py
+  Storage protocol and local filesystem implementation. Local is the only
+  implemented backend; non-local backends raise an error.
+
+- scoring.py, researcher.py, web_research.py, auditor.py, server.py
+  Earlier or alternate research/audit paths remain in the repository. Do not
+  remove or replace them without checking imports and callers. The CRM's
+  queued audit path uses business_auditor.py.
+
+- assets/prompts/audit_system.json
+  Audit evidence/prompt policy text.
+
+- assets/templates/pdf_brand.json
+  PDF brand defaults and logo-path setting.
+
+- tests/test_crm_web_pdf.py
+  HTTP-level regression test proving a tenant can download its own PDF but
+  receives 404 for another tenant's audit PDF.
+
+The repository does not currently have a tracked README or public frontend
+configuration. Use this handover plus source code as orientation, and add
+maintainer/deployment documentation after implementation.
+
+===============================================================================
+7. HTTP ROUTES IN THE CURRENT LOCAL CRM
+===============================================================================
+
+GET:
+- /                 Lead dashboard, filters, pipeline, follow-ups, CSV link.
+- /health           Basic local health response.
+- /not-listed       Search/review public unlisted-lead results.
+- /job-status       Query an audit job for the configured tenant.
+- /sweep/plan       Preview a town search plan.
+- /suppression      View the do-not-contact list.
+- /brand-logo       Serve the configured CRM logo.
+- /contact/{id}     View/edit a contact, audit history, scope, rankings.
+- /pdf/{history_id} Download an audit PDF.
+- /export.csv       Export filtered tenant contacts.
+
+POST:
+- /scope/{audit_id}/{step_id}  Update an audit checklist item.
+- /suppression/add             Add a suppression identity.
+- /sweep/run                   Confirm/run a town search/import.
+- /finder/run                  Start unlisted lead search.
+- /finder/add                  Add selected reviewed leads to the CRM.
+- /finder/dismiss              Dismiss selected finder results.
+- /rank/{contact_id}           Run ranking check.
+- /profile/save                Save contact details.
+- /audit/{contact_id}          Queue a verified-contact audit.
+
+The PDF download query is tenant-scoped and also confines served files to the
+reports directory. The cross-tenant PDF regression test is in the repository.
+
+===============================================================================
+8. DATA, PRIVACY, AND SECURITY REQUIREMENTS
+===============================================================================
+
+Current persistence:
+- SQLite database default: reports/straight_up_digital.sqlite3
+- Local generated reports, JSON snapshots, caches, usage files, and PDFs are
+  under reports/ (this directory is ignored by Git).
+- Audit history stores summary/full audit JSON and report paths.
+- MCP job results in reports/jobs are retained for 30 days, capped at 1,000,
+  and the oldest results are evicted first. This does not purge CRM audit
+  history or generated PDFs.
+- LocalStorage is the only active object-storage implementation.
+- No production migration or customer-data transfer is included in this work.
+
+Current isolation and limitations:
+- The code uses a configured CRM_TENANT_ID and many database operations are
+  tenant-filtered. It is a single local deployment context, not a fully
+  authenticated multi-customer SaaS service.
+- No user login, roles, password/session management, or production
+  authentication/authorization layer was confirmed in the CRM.
+- The local server binds to loopback and POST handlers reject non-loopback
+  requests. Do not remove these protections or expose this server directly to
+  the internet.
+- The server uses SQLite and local disk; do not assume these provide safe
+  multi-instance/serverless persistence.
+- Local database, reports, backups, .env, and auditor_config.json are private
+  local data/config and are intentionally excluded from Git. Do not copy them
+  into a public frontend, build artifact, issue, or handover attachment.
+- The real .env was not read for this handover. Never include API keys,
+  encryption keys, customer records, reports, or local database contents in
+  source control or public build output.
+- Fields such as consent, outreach permission, lifecycle, and suppression are
+  present. The operator must verify source, lawful basis, consent, retention,
+  opt-out and POPIA requirements before using imported contact data.
+
+If migrating database or storage:
+1. Agree and document the target schema, tenant mapping, and data fields first.
+2. Make a dated, access-controlled backup of the SQLite database and report
+   files; verify that the backup can be restored.
+3. Run the migration on a copy/staging environment, never first on the only
+   production copy.
+4. Preserve contact IDs/relationships, tenant IDs, consent/suppression data,
+   audit history, PDF paths/content, and timestamps.
+5. Compare source/target row counts and representative non-sensitive checks;
+   verify tenant access controls and PDF links before switching traffic.
+6. Keep the original read-only backup and a documented rollback/switch-back
+   plan until the owner accepts the migration.
+
+===============================================================================
+9. EXTERNAL SERVICES AND ENVIRONMENT CONFIGURATION
+===============================================================================
+
+Observed integration paths:
+- SerpApi: Google/Maps/search and ranking-related requests. Requires a
+  privately configured SERPAPI_API_KEY; usage may incur quota/cost.
+- Google Places API: optional lookup; requires GOOGLE_PLACES_API_KEY and the
+  relevant API/billing configuration.
+- DDGS: free, unofficial search path. Do not promise availability or exact
+  results.
+- OpenStreetMap Overpass: optional supplementary business search.
+- Public business websites: fetched with httpx; crawl limits and robots.txt
+  behavior apply.
+- ReportLab: PDF reports.
+- MCP: business_auditor.py --serve and server.py expose streamable HTTP behind
+  an MCP_BEARER_TOKEN check. The token must contain at least 32 characters;
+  startup fails if it is missing or too short. Clients must send it in the
+  Authorization: Bearer header. The default bind is 127.0.0.1:8000. For remote
+  access, use HTTPS through a trusted proxy/tunnel and configure it to preserve
+  the authorization header; never expose plain HTTP publicly.
+
+Environment variable names in .env.example include:
+- SERPAPI_API_KEY
+- CRM_ENCRYPTION_KEY_B64
+- CRM_SUPPRESSION_HMAC_KEY
+- CRM_TENANT_ID
+- AI_DAILY_COST_LIMIT_USD
+- CRM_DAILY_AUDIT_LIMIT
+- CRM_STORAGE_BACKEND
+- CRM_LOCAL_STORAGE_DIR
+- CRM_DATABASE_PATH
+- CRM_PDF_LOGO_PATH
+- MCP_BEARER_TOKEN (required for MCP HTTP; generate a random token locally)
+- MCP_HOST / MCP_PORT (MCP defaults to 127.0.0.1:8000)
+- CRM_HOST / CRM_PORT (CRM_HOST is in the sample, but crm_web.py currently
+  hardcodes 127.0.0.1; CRM_PORT controls the port)
+- GOOGLE_PLACES_API_KEY (used by source even though not listed in the sample)
+- OVERPASS_API_URL and sweep/search limits
+
+These are variable names only; no secret values belong in this document or
+Git. Use deployment secret/environment settings, not frontend variables or
+committed config. Review which values the production architecture actually
+needs; do not assume every sample variable has an implemented integration.
+No live Netlify or Cloudflare deployment integration was confirmed in the
+application code.
+
+===============================================================================
+10. DEPLOYMENT RECOMMENDATION
+===============================================================================
+
+Recommended separation:
+
+A. Public marketing site
+   - Build as a responsive static/frontend app and deploy to Netlify if that is
+     the selected platform.
+   - Keep public copy, forms, and assets separate from CRM data and secrets.
+   - A public contact form must submit only to a protected endpoint, include
+     validation, spam controls, a privacy notice, consent where applicable,
+     and a clear confirmation/error state.
+
+B. Private CRM/audit backend
+   - Host the Python service on a Python-capable managed host/container, or
+     explicitly port its backend functions if an all-Netlify implementation
+     is selected.
+   - Use a managed database suitable for concurrent production traffic and
+     durable object storage for PDFs/reports.
+   - Add authentication, user roles, server-enforced tenant ownership,
+     CSRF protection, rate limiting, secure sessions, audit logging, backups,
+     restore tests, and HTTPS before real customer data is entered.
+   - Do not trust a tenant ID supplied by the browser; derive tenant identity
+     from the authenticated server-side session.
+   - Serve PDFs only after an authorization check for the owning tenant/user.
+
+Netlify-specific caution:
+- Netlify frontend hosting does not mean this Python server and local SQLite
+  database run unchanged on Netlify.
+- Decide whether the Netlify site is only the public frontend or whether the
+  backend is being rewritten/ported. Get owner approval for that architecture
+  before implementation.
+- The repository currently has no netlify.toml or frontend build config.
+
+===============================================================================
+11. BUILD/RELEASE CHECKLIST FOR THE DEVELOPER
+===============================================================================
+
+1. Confirm with the owner:
+   - Final public business name, tagline, domain, contact details, social links,
+     address, and service areas.
+   - Final service catalogue, package scope, live prices, currency/tax wording,
+     hosting and support terms, and exclusions.
+   - Which case studies/testimonials/logos may legally be published.
+   - Whether the deliverable is only a public site or also a production CRM.
+   - Hosting architecture, expected users/tenants, authentication, and data
+     migration approval.
+
+2. Review the supplied logo guidelines and select correct SVG/PNG/favicon
+   variants. Make brand paths portable.
+
+3. Build the public site mobile-first, accessible, fast, and with clear
+   enquiry actions. Do not expose local CRM pages or private files.
+
+4. If connecting a CRM, define API contracts, auth, tenant model, database,
+   object storage, consent/suppression behavior, error handling, and backups
+   before coding the connection.
+
+5. Normalize requirements.txt to UTF-8 before using it in CI/deployment. The
+   current file begins with a UTF-16 LE BOM (FF FE); verify dependency install
+   in a clean environment after correcting/confirming its encoding.
+
+6. Test:
+   - Production frontend build and Netlify preview/deployment.
+   - Contact form validation, spam handling, and privacy/consent wording.
+   - Responsive layout, keyboard access, contrast, and broken links.
+   - CRM API authorization and cross-tenant access denial if CRM is connected.
+   - PDF authorization and safe storage/download behavior.
+   - Database backup and restore, job failure/retry behavior, and rate limits.
+   - Python regression tests with:
+       python -m unittest discover -s tests -v
+
+7. Keep credentials and customer data out of Git. Do not commit .env,
+   auditor_config.json, reports/, database files, backups, or generated client
+   reports. The project .gitignore already excludes these local items.
+
+===============================================================================
+12. OPEN ITEMS / OWNER DECISIONS
+===============================================================================
+
+- Confirm whether the public website is being built by Manus or another
+  developer and which frontend framework is preferred.
+- Confirm the public domain and DNS owner.
+- Confirm actual contact details, service areas, and final copy.
+- Approve or replace the code-default prices and retainer plans.
+- Choose whether the CRM remains private/local, is hosted separately, or is
+  rebuilt/ported.
+- Choose production database, object storage, identity provider, and hosting.
+- Decide whether any real local CRM data needs migration; none was included in
+  this handover.
+- Confirm whether API keys are available and whether their pricing/quotas are
+  acceptable before enabling paid lookups.
+- Confirm privacy notice, retention period, consent wording, and POPIA
+  operating process.
+
+END OF HANDOVER

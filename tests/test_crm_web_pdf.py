@@ -47,6 +47,7 @@ class PdfTenantIsolationTests(unittest.TestCase):
                 if tenant == "tenant-a":
                     self.tenant_a_history_id = cursor.lastrowid
                 else:
+                    self.tenant_b_contact_id = contact_ids[tenant]
                     self.tenant_b_history_id = cursor.lastrowid
 
         patchers = (
@@ -87,6 +88,25 @@ class PdfTenantIsolationTests(unittest.TestCase):
         self.assertEqual(own_body, b"tenant-a report")
         self.assertEqual(other_status, 404)
         self.assertNotIn(b"tenant-b report", other_body)
+
+    def test_pdf_is_denied_when_audit_and_contact_tenants_disagree(self):
+        with crm.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                """INSERT INTO audit_history(contact_id, audit_date, pdf_path, tenant_id)
+                   VALUES (?, ?, ?, ?)""",
+                (
+                    self.tenant_b_contact_id,
+                    "2026-11-13",
+                    str(self.reports_dir / "tenant-b.pdf"),
+                    "tenant-a",
+                ),
+            )
+            history_id = cursor.lastrowid
+
+        status, body = self._get_pdf(history_id)
+
+        self.assertEqual(status, 404)
+        self.assertNotIn(b"tenant-b report", body)
 
 
 if __name__ == "__main__":

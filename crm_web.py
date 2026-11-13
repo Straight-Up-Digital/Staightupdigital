@@ -929,10 +929,14 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/pdf/"):
             try:
                 hid = int(path.rsplit("/", 1)[1])
+                tenant = tenant_id()
                 with connect(db_path()) as conn:
                     row = conn.execute(
-                        "SELECT pdf_path FROM audit_history WHERE id=? AND tenant_id=?",
-                        (hid, tenant_id()),
+                        """SELECT h.pdf_path
+                           FROM audit_history AS h
+                           JOIN contacts AS c ON c.id = h.contact_id
+                           WHERE h.id = ? AND h.tenant_id = ? AND c.tenant_id = ?""",
+                        (hid, tenant, tenant),
                     ).fetchone()
                 pdf = Path(row["pdf_path"]).resolve() if row else None
                 reports = (PROJECT_DIR / "reports").resolve()

@@ -10,9 +10,9 @@ DB=Path(env('CRM_DATABASE_PATH','reports/straight_up_digital.sqlite3'))
 if not DB.is_absolute():DB=ROOT/DB
 
 def filter_payload(payload:dict,db_path:Path=DB,tenant_id:str|None=None)->tuple[dict,int]:
- migrate(db_path)
  tenant=tenant_id or env('CRM_TENANT_ID')
  if not tenant:raise RuntimeError('CRM_TENANT_ID required')
+ migrate(db_path,default_tenant=tenant)
  conn=sqlite3.connect(db_path)
  try:
   kept=[];skipped=0

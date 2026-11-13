@@ -31,11 +31,14 @@ import argparse
 import csv
 import hashlib
 import json
+import logging
 import os
 import re
 import random
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -55,6 +58,8 @@ REPORT_DIR = HERE / "reports"
 SWEEP_DIR = REPORT_DIR / "sweeps"
 CACHE_DIR = REPORT_DIR / "cache"
 USAGE_PATH = REPORT_DIR / "town_sweep_usage.json"
+_DAILY_USAGE_LOCK = threading.Lock()
+_LOGGER = logging.getLogger(__name__)
 
 SERPAPI_URL = env("SERPAPI_BASE_URL", "https://serpapi.com").rstrip("/") + "/search.json"
 ACCOUNT_URL = env("SERPAPI_BASE_URL", "https://serpapi.com").rstrip("/") + "/account.json"
@@ -125,6 +130,55 @@ def month() -> str:
     return datetime.now().strftime("%Y-%m")
 
 
+@contextmanager
+def _usage_file_lock():
+    with _DAILY_USAGE_LOCK:
+        lock_path = USAGE_PATH.with_name(f"{USAGE_PATH.name}.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+b") as lock_file:
+            lock_file.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+                try:
+                    yield
+                finally:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _read_usage_data() -> dict:
+    try:
+        data = json.loads(USAGE_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError("Town sweep usage data must be a JSON object.")
+    return data
+
+
+def _write_usage_data(data: dict) -> None:
+    USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = USAGE_PATH.with_name(
+        f"{USAGE_PATH.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        temp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(temp_path, USAGE_PATH)
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def usage_get() -> int:
     try:
         return int(json.loads(USAGE_PATH.read_text(encoding="utf-8")).get(month(), 0))
@@ -146,27 +200,53 @@ def daily_usage_total() -> int:
     except Exception:return 0
 
 
+def reserve_daily_search(town: str, per_town_cap: int, total_cap: int) -> bool:
+    with _usage_file_lock():
+        data = _read_usage_data()
+
+        daily = data.setdefault("daily", {})
+        if not isinstance(daily, dict):
+            raise ValueError("Town sweep daily usage must be a JSON object.")
+        day = datetime.now().strftime("%Y-%m-%d")
+        daily_counts = daily.setdefault(day, {})
+        if not isinstance(daily_counts, dict):
+            raise ValueError("Town sweep daily counts must be a JSON object.")
+
+        town_key = town.casefold()
+        town_used = int(daily_counts.get(town_key, 0))
+        total_used = sum(int(value) for value in daily_counts.values())
+        if town_used >= per_town_cap or total_used >= total_cap:
+            return False
+
+        daily_counts[town_key] = town_used + 1
+        _write_usage_data(data)
+        return True
+
+
 def daily_usage_bump(town: str) -> None:
-    try:data=json.loads(USAGE_PATH.read_text(encoding="utf-8"))
-    except Exception:data={}
-    day=datetime.now().strftime("%Y-%m-%d")
-    data.setdefault("daily",{}).setdefault(day,{})
-    data["daily"][day][town.casefold()]=int(data["daily"][day].get(town.casefold(),0))+1
-    REPORT_DIR.mkdir(parents=True,exist_ok=True)
-    USAGE_PATH.write_text(json.dumps(data,indent=2),encoding="utf-8")
+    with _usage_file_lock():
+        data = _read_usage_data()
+        day = datetime.now().strftime("%Y-%m-%d")
+        daily = data.setdefault("daily", {})
+        if not isinstance(daily, dict):
+            raise ValueError("Town sweep daily usage must be a JSON object.")
+        counts = daily.setdefault(day, {})
+        if not isinstance(counts, dict):
+            raise ValueError("Town sweep daily counts must be a JSON object.")
+        town_key = town.casefold()
+        counts[town_key] = int(counts.get(town_key, 0)) + 1
+        _write_usage_data(data)
 
 
 def usage_bump() -> None:
-    try:
-        data = json.loads(USAGE_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        data = {}
-    data[month()] = int(data.get(month(), 0)) + 1
-    try:
-        REPORT_DIR.mkdir(parents=True, exist_ok=True)
-        USAGE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+    with _usage_file_lock():
+        try:
+            data = _read_usage_data()
+            period = month()
+            data[period] = int(data.get(period, 0)) + 1
+            _write_usage_data(data)
+        except (OSError, TypeError, ValueError) as exc:
+            _LOGGER.warning("Unable to record town sweep monthly usage: %s", exc)
 
 
 def cache_file(key: str) -> Path:
@@ -204,12 +284,29 @@ def searches_left(api_key: str, client: httpx.Client) -> int | None:
 
 # ---------------------------------------------------------------- Google Maps via SerpApi
 
-def maps_search(client: httpx.Client, api_key: str, trade: str, town: str, start: int = 0) -> dict:
+def maps_search(client: httpx.Client, api_key: str, trade: str, town: str, start: int = 0,
+                per_town_cap: int | None = None, total_cap: int | None = None) -> dict:
     """One Google Maps search. Returns {'status', 'results', 'from_cache'}."""
     key = f"{trade}|{town}|{start}".lower()
     cached = cache_get(key)
     if cached is not None:
         return {"status": "ok", "results": cached, "from_cache": True}
+    reserved = False
+    if per_town_cap is not None and total_cap is not None:
+        try:
+            reserved = reserve_daily_search(town, per_town_cap, total_cap)
+        except (OSError, TypeError, ValueError) as exc:
+            return {
+                "status": "budget_unavailable",
+                "error": f"Daily sweep quota could not be safely enforced ({type(exc).__name__}).",
+                "results": [],
+            }
+        if not reserved:
+            return {
+                "status": "budget_reached",
+                "error": "Daily sweep search quota reached; no provider request was made.",
+                "results": [],
+            }
     params = {"engine": "google_maps", "q": f"{trade} in {town}, South Africa", "type": "search",
               "hl": "en", "gl": "za", "api_key": api_key}
     if start:
@@ -221,30 +318,34 @@ def maps_search(client: httpx.Client, api_key: str, trade: str, town: str, start
             if attempt == 0:
                 time.sleep(2)
                 continue
-            return {"status": "error", "error": f"{type(exc).__name__}: {exc}", "results": []}
+            return {"status": "error", "error": f"{type(exc).__name__}: {exc}", "results": [],
+                    "reserved": reserved}
         if r.status_code == 200:
             data = r.json()
             if data.get("error") and "hasn't returned any results" in str(data["error"]).lower():
                 usage_bump()
                 cache_put(key, [])
-                return {"status": "ok", "results": [], "from_cache": False}
+                return {"status": "ok", "results": [], "from_cache": False, "reserved": reserved}
             if data.get("error"):
-                return {"status": "error", "error": str(data["error"])[:200], "results": []}
+                return {"status": "error", "error": str(data["error"])[:200], "results": [],
+                        "reserved": reserved}
             results = data.get("local_results") or []
             if not results and isinstance(data.get("place_results"), dict):
                 results = [data["place_results"]]
             usage_bump()
             cache_put(key, results)
-            return {"status": "ok", "results": results, "from_cache": False}
+            return {"status": "ok", "results": results, "from_cache": False, "reserved": reserved}
         if r.status_code in (401, 403):
-            return {"status": "error", "error": f"SerpApi refused the key (HTTP {r.status_code}).", "results": []}
+            return {"status": "error", "error": f"SerpApi refused the key (HTTP {r.status_code}).", "results": [],
+                    "reserved": reserved}
         if r.status_code == 429 and attempt == 0:
             time.sleep(5)
             continue
         if attempt == 1 or r.status_code not in (429, 500, 502, 503):
-            return {"status": "error", "error": f"HTTP {r.status_code}", "results": []}
+            return {"status": "error", "error": f"HTTP {r.status_code}", "results": [],
+                    "reserved": reserved}
         time.sleep(2)
-    return {"status": "error", "error": "unknown", "results": []}
+    return {"status": "error", "error": "unknown", "results": [], "reserved": reserved}
 
 
 def lead_from_maps(item: dict, trade: str, town: str) -> dict | None:
@@ -441,18 +542,20 @@ def run_sweep(town: str, trades: list[str], max_searches: int, pages: int = 1, o
                 errors.append(f"Stopped at the search limit before '{trade}'. Raise --max-searches to continue.")
                 progress("Search limit reached. The rest of the trades were skipped.")
                 break
-            res = maps_search(client, api_key, trade, town, start)
+            res = maps_search(client, api_key, trade, town, start, daily_cap, daily_query_cap)
+            if res.get("reserved"):
+                made += 1
             if res["status"] != "ok":
                 errors.append(f"{trade}: {res.get('error')}")
                 progress(f"   {trade}: problem ({res.get('error')})")
+                if res["status"] in ("budget_reached", "budget_unavailable"):
+                    break
                 if "refused the key" in str(res.get("error", "")):
                     break
                 continue
             if res.get("from_cache"):
                 cached += 1
             else:
-                made += 1
-                daily_usage_bump(town)
                 time.sleep(random.uniform(float(env("SWEEP_MIN_DELAY_SECONDS","1")),float(env("SWEEP_MAX_DELAY_SECONDS","3"))))
             found = [lead_from_maps(i, trade, town) for i in res["results"]]
             found = [f for f in found if f]

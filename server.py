@@ -4,6 +4,7 @@ from mcp.server.mcpserver import MCPServer
 
 from researcher import research_website
 from auditor import generate_audit
+from mcp_auth import run_authenticated_mcp
 
 mcp = MCPServer("Business Opportunity Auditor")
 
@@ -41,4 +42,4 @@ def audit_business(website: str) -> str:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    run_authenticated_mcp(mcp)

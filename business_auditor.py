@@ -22,6 +22,7 @@ import hashlib
 import importlib
 import ipaddress
 import json
+import logging
 import os
 import re
 import socket
@@ -32,12 +33,14 @@ import time
 import traceback
 import urllib.robotparser
 import uuid
+from collections.abc import Iterable
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, quote_plus, unquote, urljoin, urlparse
 
+import httpcore
 import httpx
 from bs4 import BeautifulSoup
 from config_loader import env, load_env, pdf_template, prompt_config
@@ -72,6 +75,7 @@ except Exception:
 
 APP_NAME = "Business Opportunity Auditor"
 MAX_PAGES = 20
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 SEARCH_RESULTS = 8
 REPORT_DIR = Path(__file__).resolve().parent / "reports"
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -86,9 +90,12 @@ CONFIG_PATH = Path(__file__).resolve().parent / "auditor_config.json"
 CACHE_DIR = REPORT_DIR / "cache"
 JOB_DIR = REPORT_DIR / "jobs"
 USAGE_PATH = REPORT_DIR / "usage.json"
+JOB_RETENTION_DAYS = 30
+MAX_SAVED_JOBS = 1000
 for _d in (CACHE_DIR, JOB_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 _FILE_LOCK = threading.Lock()
+_LOGGER = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = {
     "agency_name": "Straight Up Digital",
@@ -214,6 +221,35 @@ def usage_bump(kind: str, period: str) -> None:
             pass
 
 
+def usage_reserve(kind: str, period: str, limit: int) -> bool:
+    with _FILE_LOCK:
+        try:
+            data = json.loads(USAGE_PATH.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            data = {}
+        if not isinstance(data, dict):
+            raise ValueError("Usage data must be a JSON object.")
+
+        bucket = data.setdefault(kind, {})
+        if not isinstance(bucket, dict):
+            raise ValueError(f"Usage data for {kind} must be a JSON object.")
+        used = int(bucket.get(period, 0))
+        if used >= limit:
+            return False
+
+        bucket[period] = used + 1
+        temp_path = USAGE_PATH.with_name(
+            f"{USAGE_PATH.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            temp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            os.replace(temp_path, USAGE_PATH)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
+        return True
+
+
 def _cache_path(key: str) -> Path:
     return CACHE_DIR / (hashlib.sha1(key.encode("utf-8")).hexdigest() + ".json")
 
@@ -235,29 +271,101 @@ def cache_put(key: str, value: dict) -> None:
         pass
 
 
-def host_is_public(host: str) -> bool:
-    """Refuse localhost, private networks and cloud metadata addresses (SSRF protection)."""
+def _public_addresses(host: str) -> tuple[str, ...]:
     host = (host or "").strip("[]").lower()
     if not host or host == "localhost" or host.endswith((".local", ".internal", ".localhost")):
-        return False
+        return ()
     try:
         ips = [ipaddress.ip_address(host)]
     except ValueError:
         try:
-            ips = [ipaddress.ip_address(info[4][0]) for info in socket.getaddrinfo(host, None)]
-        except Exception:
-            return True  # cannot be resolved, so the request itself will fail
-    return all(ip.is_global for ip in ips)
+            addresses = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        except (OSError, UnicodeError):
+            return ()
+        try:
+            ips = [ipaddress.ip_address(info[4][0]) for info in addresses]
+        except (IndexError, TypeError, ValueError):
+            return ()
+    if not ips or not all(ip.is_global for ip in ips):
+        return ()
+    return tuple(dict.fromkeys(str(ip) for ip in ips))
 
 
-def guard_request(request) -> None:
+def host_is_public(host: str) -> bool:
+    """Refuse localhost, private networks and cloud metadata addresses (SSRF protection)."""
+    return bool(_public_addresses(host))
+
+
+def guard_request(request: httpx.Request) -> None:
     if not host_is_public(request.url.host):
         raise httpx.RequestError("Blocked: that address is not a public website.")
 
 
+class PublicNetworkBackend(httpcore.SyncBackend):
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.NetworkStream:
+        addresses = _public_addresses(host)
+        if not addresses:
+            raise httpcore.ConnectError("Blocked: destination did not resolve exclusively to public IPs.")
+
+        errors: list[httpcore.ConnectError | httpcore.ConnectTimeout] = []
+        for address in addresses:
+            try:
+                return super().connect_tcp(address, port, timeout, local_address, socket_options)
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
+                errors.append(exc)
+        raise errors[-1]
+
+
+class PublicHTTPTransport(httpx.HTTPTransport):
+    def __init__(self):
+        super().__init__(trust_env=True)
+        # HTTPX 0.28.1 exposes no public network-backend option.
+        self._pool._network_backend = PublicNetworkBackend()  # pyright: ignore[reportPrivateUsage]
+
+
 def make_client(timeout: float = 18) -> httpx.Client:
     return httpx.Client(headers={"User-Agent": USER_AGENT}, timeout=timeout, follow_redirects=True,
-                        event_hooks={"request": [guard_request]})
+                        event_hooks={"request": [guard_request]}, transport=PublicHTTPTransport(),
+                        trust_env=False)
+
+
+class ResponseTooLargeError(ValueError):
+    pass
+
+
+def get_bounded_response(client: httpx.Client, url: str, max_bytes: int) -> httpx.Response:
+    with client.stream("GET", url, follow_redirects=True) as response:
+        content_length = response.headers.get("content-length")
+        if content_length:
+            try:
+                declared_length = int(content_length)
+            except ValueError:
+                declared_length = None
+            if declared_length is not None and declared_length > max_bytes:
+                raise ResponseTooLargeError(f"Response exceeds the {max_bytes}-byte limit.")
+
+        content = bytearray()
+        for chunk in response.iter_bytes(chunk_size=64 * 1024):
+            if len(content) + len(chunk) > max_bytes:
+                raise ResponseTooLargeError(f"Response exceeds the {max_bytes}-byte limit.")
+            content.extend(chunk)
+
+        headers = response.headers.copy()
+        for header in ("content-length", "content-encoding", "transfer-encoding"):
+            headers.pop(header, None)
+        return httpx.Response(
+            status_code=response.status_code,
+            headers=headers,
+            content=bytes(content),
+            request=response.request,
+        )
 
 
 class RobotsGate:
@@ -266,7 +374,7 @@ class RobotsGate:
     def __init__(self, client, origin: str):
         self.rp = None
         try:
-            resp = client.get(origin + "/robots.txt")
+            resp = get_bounded_response(client, origin + "/robots.txt", MAX_RESPONSE_BYTES)
             if resp.status_code == 200 and "<html" not in resp.text[:300].lower():
                 rp = urllib.robotparser.RobotFileParser()
                 rp.parse(resp.text.splitlines())
@@ -417,7 +525,7 @@ def collect_ld_types(node, out: set) -> None:
 
 def extract_page(url: str, client: httpx.Client) -> dict:
     try:
-        response = client.get(url, follow_redirects=True)
+        response = get_bounded_response(client, url, MAX_RESPONSE_BYTES)
         final_url = normalize_url(str(response.url))
         content_type = response.headers.get("content-type", "").lower()
         if response.status_code != 200:
@@ -940,7 +1048,7 @@ def _serpapi_raw(business_name: str, town: str, website_domain: str) -> dict:
 
 
 def serpapi_google_listing(business_name: str, town: str, website_domain: str) -> dict:
-    """Cached, budget-aware wrapper: a repeat lookup costs nothing, and the monthly free quota is protected."""
+    """Cached wrapper that reserves one monthly search slot before each live lookup."""
     if not env("SERPAPI_API_KEY"):
         return _serpapi_raw(business_name, town, website_domain)
     key = f"serp|{business_name.lower()}|{town.lower()}|{website_domain}"
@@ -949,7 +1057,15 @@ def serpapi_google_listing(business_name: str, town: str, website_domain: str) -
         cached["from_cache"] = True
         return cached
     budget = int(load_config().get("monthly_search_budget", 240))
-    if usage_get("serpapi", _month()) >= budget:
+    try:
+        reserved = usage_reserve("serpapi", _month(), budget)
+    except (OSError, TypeError, ValueError) as exc:
+        return {
+            "status": "budget_unavailable",
+            "matched": False,
+            "note": f"The monthly SerpApi budget could not be safely enforced ({type(exc).__name__}); Google data was not pulled.",
+        }
+    if not reserved:
         return {"status": "budget_reached", "matched": False,
                 "note": "The monthly SerpApi search budget has been used, so Google data was not pulled. Raise monthly_search_budget in auditor_config.json or enter the details by hand."}
     result = _serpapi_raw(business_name, town, website_domain)
@@ -957,7 +1073,6 @@ def serpapi_google_listing(business_name: str, town: str, website_domain: str) -
         time.sleep(2)
         result = _serpapi_raw(business_name, town, website_domain)
     if result.get("status") in ("matched", "unmatched_candidate", "not_found"):
-        usage_bump("serpapi", _month())
         cache_put(key, result)
     return result
 
@@ -1417,7 +1532,7 @@ QUESTION_START = re.compile(r"^(how|what|why|when|where|who|which|can|do|does|is
 
 def fetch_plain(client: httpx.Client, url: str, limit: int = 300000):
     try:
-        resp = client.get(url, follow_redirects=True)
+        resp = get_bounded_response(client, url, MAX_RESPONSE_BYTES)
         if resp.status_code == 200:
             return resp.text[:limit]
     except Exception:
@@ -2715,11 +2830,20 @@ def _wrap(payload: dict) -> str:
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
-def _cap_error():
+def _reserve_audit_quota() -> dict | None:
     limit = int(load_config().get("max_audits_per_day", 25))
-    if usage_get("audits", _today()) >= limit:
-        return {"success": False, "error": f"Daily audit limit of {limit} reached. Raise max_audits_per_day in auditor_config.json if you really need more."}
-    return None
+    try:
+        if usage_reserve("audits", _today(), limit):
+            return None
+    except (OSError, TypeError, ValueError) as exc:
+        return {
+            "success": False,
+            "error": f"Audit quota could not be safely enforced ({type(exc).__name__}); the audit was not started.",
+        }
+    return {
+        "success": False,
+        "error": f"Daily audit limit of {limit} reached. Raise max_audits_per_day in auditor_config.json if you really need more.",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2729,6 +2853,75 @@ _JOBS: dict = {}
 _RESULTS: dict = {}
 _EXECUTOR = None
 _JOB_ID_RE = re.compile(r"^[a-f0-9]{6,12}$")
+_JOB_LOCK = threading.RLock()
+
+
+def _job_record_time(job: dict) -> float:
+    try:
+        return float(job.get("finished_at", job.get("started", 0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _remove_job_file(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        _LOGGER.warning("Unable to remove expired audit job result %s: %s", path.name, exc)
+
+
+def _prune_jobs(now: float | None = None) -> None:
+    current_time = time.time() if now is None else now
+    cutoff = current_time - max(0, int(JOB_RETENTION_DAYS)) * 24 * 60 * 60
+    max_saved_jobs = max(0, int(MAX_SAVED_JOBS))
+
+    with _JOB_LOCK:
+        completed_jobs = [
+            (job_id, _job_record_time(job))
+            for job_id, job in _JOBS.items()
+            if job.get("status") not in ("queued", "running")
+        ]
+        expired_ids = {
+            job_id for job_id, finished_at in completed_jobs
+            if finished_at < cutoff
+        }
+        retained_jobs = [
+            (job_id, finished_at) for job_id, finished_at in completed_jobs
+            if job_id not in expired_ids
+        ]
+        retained_jobs.sort(key=lambda item: (item[1], item[0]), reverse=True)
+        expired_ids.update(job_id for job_id, _ in retained_jobs[max_saved_jobs:])
+        for job_id in expired_ids:
+            _JOBS.pop(job_id, None)
+            _RESULTS.pop(job_id, None)
+
+        try:
+            candidates = list(JOB_DIR.iterdir())
+        except OSError as exc:
+            _LOGGER.warning("Unable to inspect audit job result directory: %s", exc)
+            return
+
+        result_files = []
+        for path in candidates:
+            if path.suffix != ".json" or not _JOB_ID_RE.fullmatch(path.stem):
+                continue
+            try:
+                if not path.is_file():
+                    continue
+                modified_at = path.stat().st_mtime
+            except OSError as exc:
+                _LOGGER.warning("Unable to inspect audit job result %s: %s", path.name, exc)
+                continue
+            if modified_at < cutoff:
+                _remove_job_file(path)
+            else:
+                result_files.append((modified_at, path))
+
+        result_files.sort(key=lambda item: (item[0], item[1].name), reverse=True)
+        for _, path in result_files[max_saved_jobs:]:
+            _remove_job_file(path)
 
 
 def _executor():
@@ -2739,8 +2932,9 @@ def _executor():
 
 
 def _run_job(job_id: str) -> None:
-    job = _JOBS[job_id]
-    job["status"] = "running"
+    with _JOB_LOCK:
+        job = _JOBS[job_id]
+        job["status"] = "running"
     try:
         prm = job["params"]
         manual = None
@@ -2752,24 +2946,32 @@ def _run_job(job_id: str) -> None:
                           prm["nearby_towns"], prm["include_competitors"], prm["competitor_urls"],
                           progress=lambda m: job.update(step=m))
         slim = slim_audit(audit)
-        _RESULTS[job_id] = slim
+        with _JOB_LOCK:
+            _RESULTS[job_id] = slim
         try:
             (JOB_DIR / f"{job_id}.json").write_text(json.dumps(slim, ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            pass
-        job["status"], job["step"] = "done", "Finished"
+        except (OSError, TypeError, ValueError) as exc:
+            _LOGGER.warning("Unable to persist audit job result %s: %s", job_id, exc)
+        with _JOB_LOCK:
+            job["status"], job["step"] = "done", "Finished"
+            job["finished_at"] = time.time()
+        _prune_jobs()
     except Exception as exc:
-        job["status"], job["step"] = "failed", "Stopped"
-        job["error"] = f"{type(exc).__name__}: {exc}"
+        with _JOB_LOCK:
+            job["status"], job["step"] = "failed", "Stopped"
+            job["error"] = f"{type(exc).__name__}: {exc}"
+            job["finished_at"] = time.time()
+        _prune_jobs()
 
 
 def _load_audit(job_id: str):
-    if job_id in _RESULTS:
-        return _RESULTS[job_id]
-    try:
-        return json.loads((JOB_DIR / f"{job_id}.json").read_text(encoding="utf-8"))
-    except Exception:
-        return None
+    with _JOB_LOCK:
+        if job_id in _RESULTS:
+            return _RESULTS[job_id]
+        try:
+            return json.loads((JOB_DIR / f"{job_id}.json").read_text(encoding="utf-8"))
+        except Exception:
+            return None
 
 
 def test_auditor(business_name: str) -> str:
@@ -2786,20 +2988,21 @@ def start_audit(website: str, business_name: str = "", location: str = "", indus
     industry itself. If you have looked up the business on Google yourself, you may pass google_rating and
     google_review_count (they are treated as unverified). competitor_urls is an optional comma separated list.
     Do not invent results while the job is running."""
-    err = _cap_error()
-    if err:
-        return _wrap(err)
     try:
         site = normalize_input_url(website)
     except ValueError as exc:
         return _wrap({"success": False, "error": str(exc)})
-    usage_bump("audits", _today())
+    _prune_jobs()
+    err = _reserve_audit_quota()
+    if err:
+        return _wrap(err)
     job_id = uuid.uuid4().hex[:10]
-    _JOBS[job_id] = {"job_id": job_id, "status": "queued", "step": "Waiting to start", "started": time.time(), "error": None,
-                     "params": {"website": site, "business_name": clean_text(business_name)[:100], "location": clean_text(location)[:100],
-                                "industry": clean_text(industry)[:100], "nearby_towns": clean_text(nearby_towns)[:200],
-                                "competitor_urls": clean_text(competitor_urls)[:400], "google_rating": float(google_rating or 0),
-                                "google_review_count": int(google_review_count or 0), "include_competitors": bool(include_competitors)}}
+    with _JOB_LOCK:
+        _JOBS[job_id] = {"job_id": job_id, "status": "queued", "step": "Waiting to start", "started": time.time(), "error": None,
+                         "params": {"website": site, "business_name": clean_text(business_name)[:100], "location": clean_text(location)[:100],
+                                    "industry": clean_text(industry)[:100], "nearby_towns": clean_text(nearby_towns)[:200],
+                                    "competitor_urls": clean_text(competitor_urls)[:400], "google_rating": float(google_rating or 0),
+                                    "google_review_count": int(google_review_count or 0), "include_competitors": bool(include_competitors)}}
     _executor().submit(_run_job, job_id)
     return _wrap({"success": True, "job_id": job_id, "status": "queued", "expected_duration": "2 to 4 minutes",
                   "next": "Call audit_status with this job_id every 30 to 45 seconds, then audit_result."})
@@ -2807,11 +3010,13 @@ def start_audit(website: str, business_name: str = "", location: str = "", indus
 
 def audit_status(job_id: str) -> str:
     """Check on a background audit. Returns status (queued, running, done or failed) and the current step."""
-    job = _JOBS.get(job_id) if _JOB_ID_RE.match(job_id or "") else None
+    _prune_jobs()
+    with _JOB_LOCK:
+        job = dict(_JOBS[job_id]) if _JOB_ID_RE.match(job_id or "") and job_id in _JOBS else None
     if not job:
         if _JOB_ID_RE.match(job_id or "") and (JOB_DIR / f"{job_id}.json").exists():
             return _wrap({"job_id": job_id, "status": "done", "next": "Call audit_result."})
-        return _wrap({"success": False, "error": "Unknown job_id. The server may have restarted. Start a new audit."})
+        return _wrap({"success": False, "error": "Unknown or expired job_id. The server may have restarted or the result may have expired. Start a new audit."})
     out = {"job_id": job_id, "status": job["status"], "step": job["step"], "elapsed_seconds": int(time.time() - job["started"])}
     if job["status"] == "failed":
         out["error"] = job["error"]
@@ -2826,16 +3031,18 @@ def audit_result(job_id: str, section: str = "summary") -> str:
     markdown), strategy, briefs (content briefs for writers), competitors, pitch (sales brief and draft
     outreach message) or full. Lead with the top findings, be plain and specific, never present anything in
     review_before_sending as confirmed fact, and note the confidence level."""
+    _prune_jobs()
     if not _JOB_ID_RE.match(job_id or ""):
         return _wrap({"success": False, "error": "That job_id is not valid."})
-    job = _JOBS.get(job_id)
+    with _JOB_LOCK:
+        job = dict(_JOBS[job_id]) if job_id in _JOBS else None
     if job and job["status"] in ("queued", "running"):
         return _wrap({"success": False, "status": job["status"], "step": job["step"], "next": "Not finished yet. Check audit_status."})
     if job and job["status"] == "failed":
         return _wrap({"success": False, "status": "failed", "error": job["error"]})
     audit = _load_audit(job_id)
     if not audit:
-        return _wrap({"success": False, "error": "No result found for that job_id."})
+        return _wrap({"success": False, "error": "No result found for that job_id; it may have expired or been evicted."})
     data, limit = section_view(audit, section)
     return _wrap({"job_id": job_id, "section": section, "untrusted_content_notice": UNTRUSTED_NOTICE,
                   "data": sanitize_for_model(data, limit)})
@@ -2846,11 +3053,10 @@ def audit_business(website: str, business_name: str = "", location: str = "", in
     """Quick audit that waits for the answer (about 1 minute). It reads up to 8 pages, looks up the Google
     listing and skips the competitor crawl and PDF. For the full audit with competitors, strategy, content briefs
     and PDF, use start_audit instead. Only the website is required."""
-    err = _cap_error()
+    err = _reserve_audit_quota()
     if err:
         return _wrap(err)
     try:
-        usage_bump("audits", _today())
         audit = run_audit(website, business_name, location, industry, False, None, nearby_towns, False,
                           competitor_urls, crawl_pages=8)
         return _wrap({"success": True, "untrusted_content_notice": UNTRUSTED_NOTICE,
@@ -3325,11 +3531,13 @@ def serve() -> None:
     if not MCP_AVAILABLE:
         raise SystemExit("The mcp package is not available in this Python environment. Activate the project's .venv first.")
     write_default_config()
+    _prune_jobs()
     server = MCPServer("Business Opportunity Auditor")
     for fn in (test_auditor, audit_business, start_audit, audit_status, audit_result, regional_lead_sweep):
         server.tool()(fn)
     print(f"{APP_NAME} v{__version__}: MCP server starting. Tools: test_auditor, audit_business, start_audit, audit_status, audit_result, regional_lead_sweep")
-    server.run(transport="streamable-http")
+    from mcp_auth import run_authenticated_mcp
+    run_authenticated_mcp(server)
 
 
 if __name__ == "__main__":

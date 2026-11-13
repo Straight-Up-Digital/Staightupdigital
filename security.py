@@ -1,6 +1,6 @@
 """Security primitives. Keys are environment-managed; never fall back to plaintext."""
 from __future__ import annotations
-import base64,contextvars,hashlib,hmac,os,random,time
+import base64,contextvars,hashlib,hmac,os,random,re,time
 from typing import Callable,TypeVar
 from config_loader import env, load_env as load_environment
 _ACTIVE_TENANT:contextvars.ContextVar[str|None]=contextvars.ContextVar('crm_tenant_id',default=None)
@@ -40,13 +40,24 @@ def decrypt_text(value:str|None)->str|None:
  blob=base64.urlsafe_b64decode(str(value)[7:].encode('ascii'))
  return _aesgcm().decrypt(blob[:12],blob[12:],None).decode('utf-8')
 
-def suppression_hash(kind:str,value:str)->str:
+def _suppression_hash(kind:str,normalized:str)->str:
  secret=env('CRM_SUPPRESSION_HMAC_KEY')
  if not secret:raise RuntimeError('CRM_SUPPRESSION_HMAC_KEY is required for suppression matching')
- normalized=' '.join(str(value or '').casefold().split())
  if not normalized:raise ValueError('empty suppression identity')
  digest=hmac.new(secret.encode(),f'{kind}:{normalized}'.encode(),hashlib.sha256).hexdigest()
  return f'{kind}:{digest}'
+
+def _legacy_suppression_hash(kind:str,value:str)->str:
+ normalized=' '.join(str(value or '').casefold().split())
+ return _suppression_hash(kind,normalized)
+
+def suppression_hash(kind:str,value:str)->str:
+ normalized=' '.join(str(value or '').casefold().split())
+ if kind=='phone':
+  digits=re.sub(r'\D','',normalized)
+  if digits:
+   normalized='0'+digits[2:] if digits.startswith('27') else digits
+ return _suppression_hash(kind,normalized)
 
 def retry_call(fn:Callable[[],T],attempts:int=4,base_delay:float=.5,max_delay:float=8,sleep:Callable[[float],None]=time.sleep)->T:
  attempts=max(1,int(attempts))

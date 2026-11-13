@@ -4,7 +4,7 @@ import sqlite3
 from datetime import datetime,timedelta,timezone
 from pathlib import Path
 from typing import Iterable
-from security import active_tenant_id,suppression_hash
+from security import active_tenant_id,suppression_hash,_legacy_suppression_hash
 CONTACT_COLUMNS={"tenant_id":"TEXT NOT NULL DEFAULT 'straight-up-digital'","marketing_consent":"INTEGER NOT NULL DEFAULT 0","consent_recorded_at":"TEXT NOT NULL DEFAULT ''","sanitized_at":"TEXT NOT NULL DEFAULT ''","email_enc":"TEXT NOT NULL DEFAULT ''","phone_enc":"TEXT NOT NULL DEFAULT ''","lifecycle_status":"TEXT NOT NULL DEFAULT 'Scraped'","extracted_at":"TEXT NOT NULL DEFAULT ''","last_contacted_at":"TEXT NOT NULL DEFAULT ''","active_outreach":"INTEGER NOT NULL DEFAULT 0"}
 AUDIT_COLUMNS={"tenant_id":"TEXT NOT NULL DEFAULT 'straight-up-digital'"}
 
@@ -41,13 +41,24 @@ def suppression_match(conn,identities:Iterable[tuple[str,str]],tenant_id:str|Non
  tenant=tenant_id or active_tenant_id()
  for kind,value in identities:
   if not str(value or '').strip():continue
-  hashed=suppression_hash(kind,str(value))
-  row=conn.execute('select identity_type,reason from suppression_list where tenant_id=? and identity_hash=? limit 1',(tenant,hashed)).fetchone()
-  if row:return {"identity_type":row[0],"reason":row[1]}
+  hashes=[suppression_hash(kind,str(value))]
+  if kind=='phone':
+   legacy_hash=_legacy_suppression_hash(kind,str(value))
+   if legacy_hash not in hashes:hashes.append(legacy_hash)
+  for hashed in hashes:
+   row=conn.execute('select identity_type,reason from suppression_list where tenant_id=? and identity_hash=? limit 1',(tenant,hashed)).fetchone()
+   if row:return {"identity_type":row[0],"reason":row[1]}
  return None
 
 def add_suppression(conn,kind:str,value:str,reason:str='',tenant_id:str|None=None):
  tenant=tenant_id or active_tenant_id();hashed=suppression_hash(kind,value)
+ if kind=='phone':
+  legacy_hash=_legacy_suppression_hash(kind,value)
+  if legacy_hash!=hashed:
+   existing=conn.execute('select 1 from suppression_list where tenant_id=? and identity_hash=? limit 1',(tenant,hashed)).fetchone()
+   if existing:return
+   migrated=conn.execute('update suppression_list set identity_hash=? where tenant_id=? and identity_hash=?',(hashed,tenant,legacy_hash))
+   if migrated.rowcount:return
  conn.execute('insert or ignore into suppression_list(tenant_id,identity_hash,identity_type,reason,created_at) values(?,?,?,?,?)',(tenant,hashed,kind,reason,datetime.now(timezone.utc).isoformat(timespec='seconds')))
 
 def eligible_for_crm(conn,lead:dict,tenant_id:str|None=None)->bool:
