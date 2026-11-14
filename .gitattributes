@@ -1,0 +1,2 @@
+# Brand-guideline PDFs are binary assets, not whitespace-checked source.
+*.pdf binary
