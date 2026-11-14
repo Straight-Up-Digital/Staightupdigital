@@ -670,6 +670,7 @@ def crawl_website(start_url: str, max_pages: int | None = None) -> dict:
     queue = deque([start_url])
     visited, pages, external_links = set(), [], set()
     robots_blocked = 0
+    first_failure = ""
 
     with make_client(timeout=18) as client:
         parsed_start = urlparse(start_url)
@@ -685,6 +686,8 @@ def crawl_website(start_url: str, max_pages: int | None = None) -> dict:
             page = extract_page(url, client)
             time.sleep(CRAWL_DELAY)
             if not page.get("success"):
+                if not first_failure:
+                    first_failure = page.get("error") or "unknown error"
                 continue
             pages.append(page)
             for link in page.get("links", []):
@@ -715,7 +718,7 @@ def crawl_website(start_url: str, max_pages: int | None = None) -> dict:
     location_guess = next((p["town_guess"] for p in ordered if p.get("town_guess")), "")
     return {
         "success": bool(pages), "start_url": start_url, "google_signals": google_signals,
-        "js_rendered_suspected": js_suspected, "robots_blocked_count": robots_blocked,
+        "js_rendered_suspected": js_suspected, "robots_blocked_count": robots_blocked, "first_failure": first_failure,
         "location_guess": location_guess,
         "domain": domain_of(start_url), "pages_researched": len(pages),
         "pages": pages, "external_links": sorted(external_links),
@@ -746,6 +749,34 @@ def public_search(query: str, max_results: int = SEARCH_RESULTS) -> dict:
                 "error": f"{type(exc).__name__}: {exc}"}
 
 
+NAME_GENERIC = {"the", "and", "restaurant", "guest", "house", "lodge", "hotel", "cafe", "salon", "studio", "wellness", "bar",
+                "grill", "pub", "pty", "ltd", "port", "alfred", "south", "africa", "co", "inn", "spa", "beauty", "hair",
+                "coffee", "shop", "kitchen", "bistro", "bakery", "deli", "boutique"}
+
+
+def result_matches_business(item: dict, business_name: str, website_domain: str = "") -> bool:
+    """A review or Maps result only counts when it is actually about this business."""
+    hay = " ".join(clean_text(item.get(k)) for k in ("title", "url", "snippet")).lower()
+    if website_domain and website_domain.removeprefix("www.") in hay:
+        return True
+    toks = [t for t in re.findall(r"[a-z0-9]{3,}", clean_text(business_name).lower()) if t not in NAME_GENERIC]
+    if not toks:
+        return False
+    need = len(toks) if len(toks) <= 2 else -(-len(toks) * 7 // 10)
+    return sum(1 for t in toks if t in hay) >= need
+
+
+def dedupe_competitors(items: list) -> list:
+    seen, out = set(), []
+    for c in items:
+        key = (domain_of(c.get("url", "")) or "").removeprefix("www.")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+    return out
+
+
 def search_research(business_name: str, location: str, industry: str, website_domain: str) -> dict:
     business_name = clean_text(business_name) or website_domain
     location = clean_text(location)
@@ -757,6 +788,10 @@ def search_research(business_name: str, location: str, industry: str, website_do
     review_query = f'"{business_name}"{suffix} {profile["review_search"]}'
     if profile["key"] == "accommodation":
         competitor_query = f'{industry or "guest house"} {location} accommodation'.strip()
+    elif profile["key"] == "food":
+        competitor_query = f'{industry or "restaurant"} {location} menu'.strip()
+    elif profile["key"] == "beauty":
+        competitor_query = f'{industry or "salon"} {location} prices'.strip()
     else:
         competitor_query = f'{industry or business_name} {location} company'.strip()
     queries = {
@@ -781,6 +816,8 @@ def search_research(business_name: str, location: str, industry: str, website_do
         if not url or url in seen:
             continue
         seen.add(url)
+        if not result_matches_business(item, business_name, website_domain):
+            continue
         if any(host in lower for host in ("google.com/maps", "maps.google.", "g.page/", "google.com/search")):
             google_candidates.append(item)
         if any(host in lower for host in profile["review_hosts"]):
@@ -791,7 +828,8 @@ def search_research(business_name: str, location: str, industry: str, website_do
         url = item.get("url", "")
         lower = url.lower()
         if (url and url not in comp_seen and website_domain not in lower
-                and not any(d in lower for d in DIRECTORY_HOSTS)):
+                and not any(d in lower for d in DIRECTORY_HOSTS)
+                and not is_chain(item.get("title"), url)):
             comp_seen.add(url)
             competitors.append(item)
 
@@ -856,6 +894,61 @@ ACCOMMODATION_PROFILE = {
     },
 }
 
+FOOD_RE = re.compile(
+    r"\b(restaurants?|cafe|caf\u00e9|coffee( shop)?|bistro|pizzeria|pizza|takeaway|take-away|bakery|eatery|diner|grill|"
+    r"steak ?house|pub|bar|brasserie|deli|fast food|seafood|sushi|food|family restaurant|tea ?room)\b", re.I)
+BEAUTY_RE = re.compile(
+    r"\b(hair|salon|barber|beauty|spa|nails?|wellness|massage|make-?up|aesthetics?|lash(es)?|brows?|waxing|skin ?care)\b", re.I)
+
+FOOD_PROFILE = {
+    "key": "food",
+    "review_platforms": "Google, TripAdvisor and Facebook",
+    "review_search": "reviews OR TripAdvisor",
+    "review_hosts": ("tripadvisor.", "restaurantguru", "eatout.co.za", "google.com/maps", "facebook.com"),
+    "service_hints": ("menu", "food", "drinks", "specials"),
+    "hours_expected": True,
+    "service_terms": ("menu", "our food", "dine", "book a table", "reservations", "takeaway", "specials"),
+    "content_groups": {
+        "menu and specials": ("menu", "specials", "drinks", "wine list", "breakfast", "lunch", "dinner"),
+        "booking and opening hours": ("book a table", "reserve", "reservation", "opening hours", "open daily", "trading hours"),
+        "location and directions": ("directions", "find us", "located", "parking", "how to find"),
+        "photo gallery": ("gallery", "photos"),
+        "customer proof": ("reviews", "testimonials", "rated", "tripadvisor"),
+        "events and catering": ("events", "functions", "catering", "private", "celebrate"),
+    },
+}
+
+BEAUTY_PROFILE = {
+    "key": "beauty",
+    "review_platforms": "Google and Facebook",
+    "review_search": "reviews",
+    "review_hosts": ("fresha.com", "treatwell", "booksy", "google.com/maps", "facebook.com"),
+    "service_hints": ("treatment", "service", "price", "hair", "nails", "massage", "facial", "colour", "waxing", "packages"),
+    "hours_expected": True,
+    "service_terms": ("treatments", "services", "price list", "book an appointment", "packages", "we offer"),
+    "content_groups": {
+        "treatments and prices": ("treatments", "services", "price list", "prices", "packages", "specials"),
+        "how to book": ("book now", "book an appointment", "appointment", "booking", "whatsapp"),
+        "gallery": ("gallery", "our work", "before and after"),
+        "customer proof": ("reviews", "testimonials", "rated", "happy clients"),
+        "location and hours": ("opening hours", "directions", "find us", "located"),
+        "helpful content": ("blog", "tips", "aftercare", "faq"),
+    },
+}
+
+CHAIN_BRANDS = ("ocean basket", "oceanbasket", "spur", "wimpy", "steers", "kfc", "mcdonald", "nando", "debonairs",
+                "pizza hut", "romans pizza", "mugg & bean", "mugg and bean", "vida e", "woolworths", "checkers",
+                "shoprite", "pick n pay", "picknpay", "spar", "engen", "shell", "caltex", "sasol", "bp", "protea hotel",
+                "city lodge", "tsogo", "sun international", "southern sun", "mr price", "pep", "ackermans", "clicks",
+                "dis-chem", "dischem", "sorbet", "kauai", "panarottis", "hussar grill", "fishaways", "chicken licken",
+                "galito", "tashas", "col'cacchio", "burger king", "starbucks", "doppio zero", "news cafe", "primi piatti")
+_CHAIN_RE = re.compile(r"(?<![a-z0-9])(" + "|".join(re.escape(c) for c in CHAIN_BRANDS) + r")(?![a-z0-9])", re.I)
+
+
+def is_chain(*texts) -> bool:
+    return bool(_CHAIN_RE.search(" ".join(clean_text(t) for t in texts if t)))
+
+
 BOOKING_WORDS = ("book now", "book online", "booking", "availability", "reserve", "reservation", "per night",
                  "per person", "rates", "tariff", "check availability")
 
@@ -865,7 +958,14 @@ PHOTO_CAPTION_RE = re.compile(r"(\b(photos?|pictures?|images?)\s*$)|(^(photos?|p
 
 
 def industry_profile(industry: str) -> dict:
-    return ACCOMMODATION_PROFILE if ACCOMMODATION_RE.search(clean_text(industry)) else TRADE_PROFILE
+    text = clean_text(industry)
+    if ACCOMMODATION_RE.search(text):
+        return ACCOMMODATION_PROFILE
+    if FOOD_RE.search(text):
+        return FOOD_PROFILE
+    if BEAUTY_RE.search(text):
+        return BEAUTY_PROFILE
+    return TRADE_PROFILE
 
 
 def site_display_name(research: dict) -> str:
@@ -896,7 +996,23 @@ def extract_keywords(research: dict, business_name: str, location: str, industry
     stop = set("""
         the and for with from this that your you our are was were have has had not can will
         into about their they them its of in to a on by as is at be we it or an us
+        make meet new first good find all bring bringing call people plan favourite chapter contact email
+        discover welcome home more best great owners owner passion genuine together here visit enquire
+        under over also just get got let our out one two time like love enjoy come see today
     """.split())
+    stop |= set(re.findall(r"[a-z]{3,}", clean_text(industry).lower())) - {"restaurant", "salon", "guest", "house"}
+    protected = set(re.findall(r"[a-z]{3,}", (clean_text(business_name) + " " + clean_text(location)).lower()))
+    namelike = set()
+    for page in pages:
+        if isinstance(page, dict):
+            for sent in re.split(r"(?<=[.!?])\s+", clean_text(page.get("description", ""))):
+                for w in re.findall(r"(?<=[a-z,] )([A-Z][a-z]{2,})\b", sent):
+                    if w.lower() not in protected:
+                        namelike.add(w.lower())
+                for w in re.findall(r"\b(?:and|&)\s+([A-Z][a-z]{2,})\b", sent):
+                    if w.lower() not in protected:
+                        namelike.add(w.lower())
+    stop |= namelike
     for page in pages:
         if not isinstance(page, dict):
             continue
@@ -921,6 +1037,7 @@ def extract_keywords(research: dict, business_name: str, location: str, industry
     recurring = sorted(freq, key=lambda x: (-freq[x], x))[:25]
 
     seeds = []
+    industry = clean_text(industry).split(",")[0].strip()
     for seed in (industry, business_name):
         seed = clean_text(seed)
         if seed and seed.lower() not in [s.lower() for s in seeds]:
@@ -928,9 +1045,22 @@ def extract_keywords(research: dict, business_name: str, location: str, industry
     town = clean_text(location).split(",")[0].strip()
     industry_seed = clean_text(industry).lower()
     long_tail = []
-    accommodation = industry_profile(industry)["key"] == "accommodation"
+    pkey = industry_profile(industry)["key"]
+    accommodation = pkey == "accommodation"
     for seed in seeds[:3]:
-        if seed.lower() == industry_seed:
+        if seed.lower() == industry_seed and pkey == "food":
+            for suffix in ("menu", "prices", "near me", "reviews", "book a table", "opening hours"):
+                long_tail.append(f"{seed} {suffix}")
+            if town:
+                long_tail += [f"{seed} {town}", f"best {seed} in {town}", f"{seed} {town} menu", f"{seed} {town} reviews",
+                              f"{seed} {town} book a table", f"where to eat in {town}", f"{seed} near {town}"]
+        elif seed.lower() == industry_seed and pkey == "beauty":
+            for suffix in ("prices", "near me", "reviews", "book an appointment", "specials"):
+                long_tail.append(f"{seed} {suffix}")
+            if town:
+                long_tail += [f"{seed} {town}", f"best {seed} in {town}", f"{seed} {town} prices",
+                              f"{seed} {town} appointment", f"{seed} near {town}"]
+        elif seed.lower() == industry_seed:
             if accommodation:
                 for suffix in ("rates", "rooms", "bed and breakfast", "book direct", "near me", "reviews"):
                     long_tail.append(f"{seed} {suffix}")
@@ -946,7 +1076,10 @@ def extract_keywords(research: dict, business_name: str, location: str, industry
                         long_tail.append(clean_text(f"{seed} {town} {suffix}"))
                     long_tail.append(f"{seed} near {town}")
         else:
-            suffixes = ("reviews", "contact details", "rates", "book") if accommodation else ("reviews", "contact details", "prices", "quote")
+            suffixes = (("reviews", "contact details", "rates", "book") if accommodation
+                        else ("menu", "reviews", "opening hours", "book a table") if pkey == "food"
+                        else ("prices", "reviews", "opening hours", "book") if pkey == "beauty"
+                        else ("reviews", "contact details", "prices", "quote"))
             for suffix in suffixes:
                 long_tail.append(f"{seed} {suffix}")
     return {
@@ -1767,6 +1900,8 @@ def question_headings(pages: list) -> list:
 
 def detect_services(research: dict, business_name: str, industry: str = "") -> list:
     found = []
+    if industry_profile(industry)["key"] == "food":
+        return []   # a menu is not a list of services; dish names would read as junk
     hints = industry_profile(industry)["service_hints"]
 
     def add(text, source):
@@ -1932,7 +2067,7 @@ def link_audit(research: dict, extras: dict) -> dict:
     }
 
 
-def ai_readiness(research: dict, extras: dict, pages: list) -> list:
+def ai_readiness(research: dict, extras: dict, pages: list, town: str = "") -> list:
     sig = research.get("google_signals") or {}
     types = {t.lower() for t in sig.get("structured_data_types", [])}
     socials = research.get("social_profiles") or {}
@@ -1950,13 +2085,19 @@ def ai_readiness(research: dict, extras: dict, pages: list) -> list:
     else:
         add("AI and search crawlers allowed", True, "robots.txt does not block the main AI crawlers." if extras.get("robots_found") else "No robots.txt found, so nothing is blocked.")
     add("XML sitemap available", extras.get("sitemap_found"), f"{len(extras.get('sitemap_urls', []))} URL(s) listed." if extras.get("sitemap_found") else "No sitemap found at /sitemap.xml or in robots.txt.")
-    has_org = any(t in ("localbusiness", "organization", "corporation") or t.endswith("business") or t.endswith("store") for t in types)
+    local_types = {"localbusiness", "organization", "corporation", "restaurant", "hotel", "motel", "hostel", "lodging",
+                   "bedandbreakfast", "cafeorcoffeeshop", "bakery", "barorpub", "foodestablishment", "fastfoodrestaurant",
+                   "beautysalon", "hairsalon", "dayspa", "nailsalon", "healthclub", "autorepair", "dentist", "physician",
+                   "realestateagent", "legalservice", "accountingservice", "electrician", "plumber", "locksmith"}
+    has_org = any(t in local_types or t.endswith("business") or t.endswith("store") for t in types)
     add("LocalBusiness or Organization schema", has_org, "Found." if has_org else "Not found. This helps search engines and AI tools understand who the business is.")
     add("sameAs links to official profiles", "sameas" in types, "Found in structured data." if "sameas" in types else "Not found. List the Google, Facebook and other official profiles in schema so the business is recognised as one entity.")
     qn = len(question_headings(pages))
     add("Question and FAQ coverage", qn >= 3 or "faqpage" in types, f"{qn} question-style heading(s) found." if qn else "No question-style headings found. Answering real customer questions helps both search and AI answers.")
     add("Social profiles linked", len(socials) >= 2, f"Linked: {', '.join(sorted(socials)) or 'none'}.")
-    nap = bool(bs.get("phone_candidates")) and bool(research.get("location_guess"))
+    place_known = bool(research.get("location_guess")) or bool(
+        town and town.lower() in clean_text(research.get("combined_text", "")).lower())
+    nap = bool(bs.get("phone_candidates")) and place_known
     add("Name, address and phone visible", nap, "Phone number and a town were found on the site." if nap else "Could not confirm both a phone number and an address on the site.")
     has_about = any(page_type(p) == "About" for p in pages)
     add("About page with proof of experience", has_about and bool(bs.get("established_year_text_match")), "About page found and a founding year is stated." if has_about and bs.get("established_year_text_match") else "Make sure an About page shows who is behind the business, years in business and real proof.")
@@ -2068,10 +2209,106 @@ def build_accommodation_briefs(business_name: str, town: str, matrix: list, gaps
     return briefs[:5]
 
 
+def build_food_briefs(business_name: str, town: str, gaps: dict, research: dict, external: dict) -> list:
+    g = external.get("google_places") or {}
+    pages = research.get("pages", [])
+    where = town or "town"
+    proof = []
+    if g.get("matched") and g.get("rating"):
+        proof.append(f"Google rating of {g['rating']} from {g.get('review_count')} reviews (quote it only if current)")
+    proof += ["Real photos of your food, venue and team", "Address, phone and opening hours, so the place is clearly real"]
+    paths = " ".join(urlparse(p["url"]).path.lower() for p in pages)
+    briefs = []
+    if "menu" not in paths:
+        briefs.append({
+            "page_type": "Menu page", "working_title": clean_text(f"Menu | {business_name}, {town}") if town else f"Menu | {business_name}",
+            "target_phrase": clean_text(f"restaurant menu {town}").lower(),
+            "intent": "Commercial and local: the visitor is deciding where to eat and wants to see the menu and prices.",
+            "why": "No menu page was found in the crawl. The menu is the page most restaurant visitors look for first.",
+            "h1": "Our menu", "outline": ["Menu as real text, not only a photo or PDF", "Prices and dietary notes",
+                                         "Specials and seasonal items", "How to book or order"],
+            "questions_to_answer": ["Do you have vegetarian or vegan options?", "Do you do takeaways?", "Are your prices current?"],
+            "internal_links": ["Main menu, home page and booking page"], "proof_to_include": proof,
+            "schema": ["Restaurant", "Menu"], "suggested_length": "As long as the menu needs. Keep it easy to scan."})
+    if not has_booking_signal(research):
+        briefs.append({
+            "page_type": "Booking and opening hours", "working_title": f"Book a table | {business_name}",
+            "target_phrase": clean_text(f"book a table {town}").lower(),
+            "intent": "Transactional: the visitor is ready to book or check when you are open.",
+            "why": "No booking or opening-hours wording was found, so interested visitors have no clear next step.",
+            "h1": "Book a table", "outline": ["Phone and WhatsApp booking", "Opening hours for every day, including public holidays",
+                                              "Group and function enquiries", "Parking and directions"],
+            "questions_to_answer": ["Do I need to book?", "What time do you open and close?", "Can you host a group or birthday?"],
+            "internal_links": ["A booking button on every page"], "proof_to_include": proof[:2],
+            "schema": ["Restaurant", "OpeningHoursSpecification"], "suggested_length": "Short and clear."})
+    if gaps.get("own_question_headings", 0) < 3:
+        briefs.append({
+            "page_type": "FAQ section on key pages", "working_title": f"FAQs for {business_name}",
+            "target_phrase": "diner questions", "intent": "Informational: people checking details before they visit.",
+            "why": "The site answers very few direct questions, which also limits visibility in AI answers.",
+            "h1": "Frequently asked questions",
+            "outline": ["Opening hours", "Booking and groups", "Parking and access", "Dietary needs", "Kids, pets and functions"],
+            "questions_to_answer": ["Do I need to book?", "Do you have parking?", "Do you cater for dietary needs?",
+                                    "Are children and pets welcome?", f"Where exactly are you in {where}?"],
+            "internal_links": ["Add the relevant questions to the menu and booking pages"],
+            "proof_to_include": proof[:2], "schema": ["FAQPage"], "suggested_length": "Short, direct answers."})
+    return briefs[:5]
+
+
+def build_beauty_briefs(business_name: str, town: str, gaps: dict, research: dict, external: dict) -> list:
+    g = external.get("google_places") or {}
+    pages = research.get("pages", [])
+    where = town or "town"
+    proof = []
+    if g.get("matched") and g.get("rating"):
+        proof.append(f"Google rating of {g['rating']} from {g.get('review_count')} reviews (quote it only if current)")
+    proof += ["Real photos of your work and your space (with client permission)", "Address, phone and opening hours"]
+    paths = " ".join(urlparse(p["url"]).path.lower() for p in pages)
+    briefs = []
+    if not any(k in paths for k in ("treatment", "service", "price", "menu")):
+        briefs.append({
+            "page_type": "Treatments and price list", "working_title": clean_text(f"Treatments and prices | {business_name}, {town}") if town else f"Treatments and prices | {business_name}",
+            "target_phrase": clean_text(f"salon prices {town}").lower(),
+            "intent": "Commercial and local: the visitor is comparing treatments and prices.",
+            "why": "No treatments or price page was found in the crawl.",
+            "h1": "Treatments and prices", "outline": ["Each treatment with a short description and duration", "Prices or 'from' prices",
+                                                       "Packages and specials", "How to book"],
+            "questions_to_answer": ["How much does it cost?", "How long does it take?", "Do I need a patch test?"],
+            "internal_links": ["Main menu, home page and booking page"], "proof_to_include": proof,
+            "schema": ["HealthAndBeautyBusiness", "Offer"], "suggested_length": "As long as the list needs. Keep prices easy to scan."})
+    if not has_booking_signal(research) and not any(k in paths for k in ("book", "appointment")):
+        briefs.append({
+            "page_type": "Booking path", "working_title": f"Book an appointment | {business_name}",
+            "target_phrase": clean_text(f"book appointment {town}").lower(),
+            "intent": "Transactional: the visitor is ready to book.",
+            "why": "No booking wording was found, so interested visitors have no clear next step.",
+            "h1": "Book an appointment", "outline": ["WhatsApp, phone and online booking options", "Opening hours", "Cancellation and deposit terms"],
+            "questions_to_answer": ["How do I book?", "What is your cancellation policy?", "Do you take walk-ins?"],
+            "internal_links": ["A booking button on every page"], "proof_to_include": proof[:2],
+            "schema": ["HealthAndBeautyBusiness"], "suggested_length": "Short and clear."})
+    if gaps.get("own_question_headings", 0) < 3:
+        briefs.append({
+            "page_type": "FAQ section on key pages", "working_title": f"FAQs for {business_name}",
+            "target_phrase": "client questions", "intent": "Informational: people checking details before they book.",
+            "why": "The site answers very few direct questions, which also limits visibility in AI answers.",
+            "h1": "Frequently asked questions",
+            "outline": ["Booking and cancellations", "Prices and deposits", "Aftercare", "Parking and access"],
+            "questions_to_answer": ["How do I book?", "What do I need to bring?", "What is your cancellation policy?",
+                                    f"Where are you in {where}?"],
+            "internal_links": ["Add the relevant questions to the treatments page"],
+            "proof_to_include": proof[:2], "schema": ["FAQPage"], "suggested_length": "Short, direct answers."})
+    return briefs[:5]
+
+
 def build_briefs(business_name: str, town: str, matrix: list, loc: list, gaps: dict,
                  research: dict, external: dict, industry: str = "") -> list:
-    if industry_profile(industry)["key"] == "accommodation":
+    pk = industry_profile(industry)["key"]
+    if pk == "accommodation":
         return build_accommodation_briefs(business_name, town, matrix, gaps, research, external)
+    if pk == "food":
+        return build_food_briefs(business_name, town, gaps, research, external)
+    if pk == "beauty":
+        return build_beauty_briefs(business_name, town, gaps, research, external)
     g = external.get("google_places") or {}
     est = (research.get("business_signals") or {}).get("established_year_text_match")
     proof = []
@@ -2151,10 +2388,13 @@ def build_strategy(research, business_name, town, industry, external, comp_sites
             towns.append(t)
     loc = location_plan(towns, town, pages, comp_sites)
     gaps = content_gaps(research, comp_sites, business_name)
+    if industry_profile(industry)["key"] != "trade":
+        gaps["page_types_competitors_have_that_you_lack"] = [
+            "Photo gallery" if t == "Portfolio or gallery" else t for t in gaps.get("page_types_competitors_have_that_you_lack", [])]
     return {
         "industry_profile": industry_profile(industry)["key"],
         "service_coverage": matrix, "location_plan": loc, "competitor_gaps": gaps,
-        "link_audit": link_audit(research, extras), "ai_search_readiness": ai_readiness(research, extras, pages),
+        "link_audit": link_audit(research, extras), "ai_search_readiness": ai_readiness(research, extras, pages, town),
         "briefs": build_briefs(business_name, town, matrix, loc, gaps, research, external, industry),
         "demand_note": "Search volume and rankings were not measured. Page recommendations rest on what the site contains, what competitors publish and the standard rules for avoiding thin or doorway-style local pages."
     }
@@ -2214,38 +2454,38 @@ def strategy_opportunities(st: dict) -> list:
     return out
 
 
-def strategy_story(st: dict, styles) -> list:
+def strategy_story(st: dict, styles, sec=None, brand_colours=None, fw=None) -> list:
     if not st:
         return []
     brand = pdf_template()
-    table_primary = colors.HexColor(brand.get("primary_color", "#080A09"))
-    table_border = colors.HexColor(brand.get("border_color", "#D9DED8"))
-    table_row = colors.HexColor("#F7F8F5")
-    out = [Paragraph("5. Content and local SEO strategy", styles["Section"]),
-           Paragraph(ptext(st.get("demand_note", "")), styles["BodySmall"])]
+    if brand_colours:
+        table_primary, table_border, accent_c, soft_c = brand_colours
+    else:
+        table_primary = colors.HexColor(brand.get("primary_color", "#080A09"))
+        table_border = colors.HexColor(brand.get("border_color", "#D9DED8"))
+        accent_c = colors.HexColor(brand.get("accent_color", "#A8FF65"))
+        soft_c = colors.HexColor(brand.get("soft_ivory", "#F2F4EF"))
+    fw = fw or 174*mm
+    heading = sec("5. Content and local SEO strategy") if sec else Paragraph("5. Content and local SEO strategy", styles["Section"])
+    out = [heading, Paragraph(ptext(st.get("demand_note", "")), styles["BodySmall"])]
 
     def P(text, style="TableText"):
         return Paragraph(ptext(text), styles[style])
 
     def table(rows, widths):
-        t = Table(rows, colWidths=widths, repeatRows=1)
-        t.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), table_primary),
-            ("GRID", (0, 0), (-1, -1), 0.35, table_border),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, table_row]),
-            ("LEFTPADDING", (0, 0), (-1, -1), 5), ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-            ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
-        return t
+        return styled_table(rows, widths, table_primary, table_border)
 
     head = lambda t: Paragraph("<b>%s</b>" % ptext(t), styles["TableHead"])
-    out.append(Paragraph("Service page coverage", styles["SubSection"]))
+    is_food = st.get("industry_profile") == "food"
+    out.append(Paragraph("Menu and offer coverage" if is_food else "Service page coverage", styles["SubSection"]))
     matrix = st.get("service_coverage", [])
     if matrix:
         rows = [[head("Service detected"), head("Listed on"), head("Own page")]]
         for m in matrix[:12]:
             rows.append([P(m["service"]), P(m.get("listed_on") or ""), P(m["dedicated_page"] or "None found")])
-        out.append(table(rows, [45*mm, 60*mm, 50*mm]))
+        out.append(table(rows, [45*mm, 60*mm, fw - 105*mm]))
+    elif is_food:
+        out.append(Paragraph("A restaurant is judged on its menu, opening hours and booking details rather than a list of services. See the content briefs below.", styles["BodySmall"]))
     else:
         out.append(Paragraph("No clear list of services was detected. Review the service structure manually.", styles["BodySmall"]))
 
@@ -2254,7 +2494,7 @@ def strategy_story(st: dict, styles) -> list:
     for item in st.get("location_plan", []):
         rows.append([P(item["town"]), P(item["verdict"])])
     if len(rows) > 1:
-        out.append(table(rows, [35*mm, 120*mm]))
+        out.append(table(rows, [35*mm, fw - 35*mm]))
     else:
         out.append(Paragraph("No town was detected. Supply the main town and nearby towns to get a location plan.", styles["BodySmall"]))
 
@@ -2285,23 +2525,27 @@ def strategy_story(st: dict, styles) -> list:
     out.append(Paragraph("AI search readiness", styles["SubSection"]))
     rows = [[head("Check"), head("Result"), head("Detail")]]
     for c in st.get("ai_search_readiness", []):
-        rows.append([P(c["check"]), P(c["status"]), P(c["detail"])])
-    out.append(table(rows, [50*mm, 16*mm, 89*mm]))
+        colour = {"Pass": "#3F7D1A", "Fix": "#C0392B"}.get(c["status"], "#687168")
+        rows.append([P(c["check"]), Paragraph(f'<font color="{colour}"><b>{ptext(c["status"])}</b></font>', styles["TableText"]), P(c["detail"])])
+    out.append(table(rows, [50*mm, 16*mm, fw - 66*mm]))
 
-    out.append(Paragraph("Content briefs ready to hand to a writer", styles["SubSection"]))
+    brief_head = Paragraph("Content briefs ready to hand to a writer", styles["SubSection"])
     for i, b in enumerate(st.get("briefs", [])[:4], 1):
-        block = [Paragraph(f"<b>Brief {i}: {ptext(b['page_type'])}</b>", styles["BodySmall"]),
-                 Paragraph(f"<b>Working title:</b> {ptext(b['working_title'])}", styles["BodySmall"]),
-                 Paragraph(f"<b>Target phrase:</b> {ptext(b['target_phrase'])} (search demand not measured)", styles["BodySmall"]),
-                 Paragraph(f"<b>Intent:</b> {ptext(b['intent'])}", styles["BodySmall"]),
-                 Paragraph(f"<b>Why:</b> {ptext(b['why'])}", styles["BodySmall"]),
-                 Paragraph("<b>Outline:</b> " + ptext("; ".join(b["outline"])), styles["BodySmall"]),
-                 Paragraph("<b>Questions to answer:</b> " + ptext("; ".join(b["questions_to_answer"])), styles["BodySmall"]),
-                 Paragraph("<b>Internal links:</b> " + ptext("; ".join(b["internal_links"])), styles["BodySmall"]),
-                 Paragraph("<b>Proof to include:</b> " + ptext("; ".join(b["proof_to_include"])), styles["BodySmall"]),
-                 Paragraph("<b>Schema:</b> " + ptext(", ".join(b["schema"])), styles["Subtle"]),
-                 Spacer(1, 3*mm)]
-        out.append(KeepTogether(block))
+        body = [Paragraph(f"Brief {i}: {ptext(b['page_type'])}", styles["CardTitle"]),
+                Paragraph(f"<b>Working title:</b> {ptext(b['working_title'])}", styles["BodySmall"]),
+                Paragraph(f"<b>Target phrase:</b> {ptext(b['target_phrase'])} (search demand not measured)", styles["BodySmall"]),
+                Paragraph(f"<b>Intent:</b> {ptext(b['intent'])}", styles["BodySmall"]),
+                Paragraph(f"<b>Why:</b> {ptext(b['why'])}", styles["BodySmall"]),
+                Paragraph("<b>Outline:</b> " + ptext("; ".join(b["outline"])), styles["BodySmall"]),
+                Paragraph("<b>Questions to answer:</b> " + ptext("; ".join(b["questions_to_answer"])), styles["BodySmall"]),
+                Paragraph("<b>Internal links:</b> " + ptext("; ".join(b["internal_links"])), styles["BodySmall"]),
+                Paragraph("<b>Proof to include:</b> " + ptext("; ".join(b["proof_to_include"])), styles["BodySmall"]),
+                Paragraph("Schema: " + ptext(", ".join(b["schema"])), styles["Subtle"])]
+        box = Table([[body]], colWidths=[fw])
+        box.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), soft_c), ("LINEBEFORE", (0, 0), (0, -1), 3, accent_c),
+                                 ("LEFTPADDING", (0, 0), (-1, -1), 11), ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+                                 ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
+        out += [KeepTogether(([brief_head] if i == 1 else []) + [box]), Spacer(1, 2.5*mm)]
     return out
 
 
@@ -2425,6 +2669,120 @@ def _register_brand_pdf_fonts() -> tuple[str, str, str]:
         return "Helvetica", "Helvetica-Bold", "Helvetica-Bold"
 
 
+if REPORTLAB_AVAILABLE:
+    from reportlab.platypus import Flowable as _Flowable
+
+    class ScoreDial(_Flowable):
+        """Round score gauge: a track ring, a coloured arc and the score in the middle."""
+
+        def __init__(self, score, size=44*mm, track="#E3E8E1", fill="#79B842", text="#080A09",
+                     sub="#687168", font="Helvetica-Bold", subfont="Helvetica", label="/100", thickness=None):
+            super().__init__()
+            self.score, self.size = score, size
+            self.track, self.fill, self.text, self.sub = track, fill, text, sub
+            self.font, self.subfont, self.label = font, subfont, label
+            self.thickness = thickness or size * 0.11
+            self.width = self.height = size
+
+        def wrap(self, aw, ah):
+            return self.size, self.size
+
+        def draw(self):
+            c = self.canv
+            cx = cy = self.size / 2
+            r = self.size / 2 - self.thickness / 2 - 0.5
+            c.saveState()
+            c.setLineCap(1)
+            c.setLineWidth(self.thickness)
+            c.setStrokeColor(colors.HexColor(self.track))
+            c.circle(cx, cy, r, stroke=1, fill=0)
+            try:
+                frac = max(0.0, min(1.0, float(self.score) / 100.0))
+            except (TypeError, ValueError):
+                frac = 0.0
+            if frac > 0:
+                c.setStrokeColor(colors.HexColor(self.fill))
+                c.arc(cx - r, cy - r, cx + r, cy + r, 90, -360 * frac)
+            c.setFillColor(colors.HexColor(self.text))
+            c.setFont(self.font, self.size * 0.32)
+            shown = "n/a" if self.score is None else str(self.score)
+            c.drawCentredString(cx, cy - self.size * 0.04, shown)
+            c.setFillColor(colors.HexColor(self.sub))
+            c.setFont(self.subfont, self.size * 0.10)
+            c.drawCentredString(cx, cy - self.size * 0.20, self.label)
+            c.restoreState()
+
+    class SectionBar(_Flowable):
+        """Numbered section heading with an accent block and a hairline."""
+
+        def __init__(self, title, font="Helvetica-Bold", ink="#080A09", accent="#A8FF65",
+                     badge="#3F7D1A", line="#D9DED8", subfont=None):
+            super().__init__()
+            m = re.match(r"^\s*(\d+)\.\s*(.*)$", title)
+            self.num, self.title = (m.group(1), m.group(2)) if m else ("", title)
+            self.font, self.ink, self.accent, self.badge, self.line = font, ink, accent, badge, line
+            self.keepWithNext = True
+            self.height = 13*mm
+
+        def wrap(self, aw, ah):
+            self.width = aw
+            return aw, self.height
+
+        def draw(self):
+            c = self.canv
+            c.saveState()
+            x = 0
+            y = 3*mm
+            c.setFillColor(colors.HexColor(self.accent))
+            c.rect(0, y, 1.6*mm, 8*mm, stroke=0, fill=1)
+            x = 4.2*mm
+            if self.num:
+                c.setFillColor(colors.HexColor(self.badge))
+                c.setFont(self.font, 8.5)
+                c.drawString(x, y + 5.2*mm, f"SECTION {int(self.num):02d}")
+                c.setFillColor(colors.HexColor(self.ink))
+                c.setFont(self.font, 15)
+                c.drawString(x, y + 0.3*mm, self.title)
+            else:
+                c.setFillColor(colors.HexColor(self.ink))
+                c.setFont(self.font, 15)
+                c.drawString(x, y + 2.2*mm, self.title)
+            c.setStrokeColor(colors.HexColor(self.line))
+            c.setLineWidth(0.6)
+            c.line(0, 0.8*mm, self.width, 0.8*mm)
+            c.restoreState()
+
+
+PRIORITY_COLOURS = {"High": ("#C0392B", "#FFFFFF"), "Medium": ("#E0A800", "#2A2100"), "Low": ("#79B842", "#10230A")}
+
+
+def priority_tag(level: str, style):
+    bg, fg = PRIORITY_COLOURS.get(level, ("#687168", "#FFFFFF"))
+    t = Table([[Paragraph(f'<font color="{fg}"><b>{ptext(str(level).upper())}</b></font>', style)]],
+              colWidths=[17*mm], rowHeights=[5.2*mm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(bg)),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 1), ("RIGHTPADDING", (0, 0), (-1, -1), 1),
+        ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
+    t.hAlign = "LEFT"
+    return t
+
+
+def styled_table(rows, widths, primary, border, zebra="#F7F8F5", header=True, pad=5):
+    t = Table(rows, colWidths=widths, repeatRows=1 if header else 0)
+    cmds = [
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LINEBELOW", (0, 1 if header else 0), (-1, -1), 0.4, border),
+        ("ROWBACKGROUNDS", (0, 1 if header else 0), (-1, -1), [colors.white, colors.HexColor(zebra)]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6), ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), pad), ("BOTTOMPADDING", (0, 0), (-1, -1), pad)]
+    if header:
+        cmds += [("BACKGROUND", (0, 0), (-1, 0), primary), ("VALIGN", (0, 0), (-1, 0), "MIDDLE")]
+    t.setStyle(TableStyle(cmds))
+    return t
+
+
 def make_pdf(audit: dict) -> str:
     if not REPORTLAB_AVAILABLE:
         raise RuntimeError("PDF generation needs ReportLab. Install it in the project virtual environment with: python -m pip install reportlab")
@@ -2432,220 +2790,261 @@ def make_pdf(audit: dict) -> str:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     path = REPORT_DIR / f"{slug}-growth-audit-{timestamp}.pdf"
 
+    left_m = right_m = 18*mm
     doc = SimpleDocTemplate(
-        str(path), pagesize=A4, rightMargin=18*mm, leftMargin=18*mm,
-        topMargin=21*mm, bottomMargin=18*mm, title=f"{audit.get('business_name')} Growth Audit",
+        str(path), pagesize=A4, rightMargin=right_m, leftMargin=left_m,
+        topMargin=22*mm, bottomMargin=19*mm, title=f"{audit.get('business_name')} Growth Audit",
         author=APP_NAME
     )
+    FW = A4[0] - left_m - right_m
     styles = getSampleStyleSheet()
     brand = pdf_template()
     primary = colors.HexColor(brand.get("primary_color", "#080A09"))
     accent = colors.HexColor(brand.get("accent_color", "#A8FF65"))
+    accent_dark = colors.HexColor(brand.get("accent_dark_color", "#3F7D1A"))
     text_color = colors.HexColor(brand.get("text_color", "#252B27"))
     muted_color = colors.HexColor(brand.get("muted_color", "#687168"))
     soft_ivory = colors.HexColor(brand.get("soft_ivory", "#F2F4EF"))
     border_color = colors.HexColor(brand.get("border_color", "#D9DED8"))
+    dark_card = colors.HexColor("#141A16")
     body_font, body_bold, heading_font = _register_brand_pdf_fonts()
+    registered = set(pdfmetrics.getRegisteredFontNames())
+    heading_bold = "Montserrat-Bold" if "Montserrat-Bold" in registered else body_bold
     styles["Normal"].fontName = body_font
     styles["Normal"].textColor = text_color
     styles["BodyText"].fontName = body_font
     styles["BodyText"].textColor = text_color
-    styles["BodyText"].fontSize = 9
-    styles["BodyText"].leading = 13
-    styles["Title"].fontName = heading_font
-    styles["Heading1"].fontName = heading_font
-    styles["Heading1"].textColor = primary
-    styles["Heading2"].fontName = heading_font
-    styles["Heading2"].textColor = primary
-    styles.add(ParagraphStyle(name="CoverTitle", parent=styles["Title"], fontName=heading_font,
-                              fontSize=25, leading=31, alignment=TA_LEFT, textColor=primary,
-                              spaceAfter=10))
+    styles["BodyText"].fontSize = 9.2
+    styles["BodyText"].leading = 14
+    styles.add(ParagraphStyle(name="CoverTitle", parent=styles["Normal"], fontName=heading_bold,
+                              fontSize=34, leading=40, alignment=TA_LEFT, textColor=colors.white, spaceAfter=8))
     styles.add(ParagraphStyle(name="CoverKicker", parent=styles["Normal"], fontName=body_bold,
-                              fontSize=8, leading=11, textColor=muted_color, spaceAfter=3))
-    styles.add(ParagraphStyle(name="Tagline", parent=styles["Normal"], fontName=body_bold,
-                              fontSize=8.5, leading=12, textColor=primary, spaceAfter=5))
+                              fontSize=8.5, leading=12, textColor=accent, spaceAfter=3))
+    styles.add(ParagraphStyle(name="CoverSub", parent=styles["Normal"], fontName=body_font,
+                              fontSize=11, leading=16, textColor=colors.HexColor("#C9D1CB")))
+    styles.add(ParagraphStyle(name="CoverLabel", parent=styles["Normal"], fontName=body_bold,
+                              fontSize=7.5, leading=10, textColor=colors.HexColor("#8E9A92")))
+    styles.add(ParagraphStyle(name="CoverValue", parent=styles["Normal"], fontName=body_font,
+                              fontSize=10, leading=14, textColor=colors.white))
+    styles.add(ParagraphStyle(name="CoverFine", parent=styles["Normal"], fontName=body_font,
+                              fontSize=8.5, leading=12, textColor=colors.HexColor("#8E9A92")))
     styles.add(ParagraphStyle(name="Subtle", parent=styles["Normal"], fontName=body_font,
-                              fontSize=8, leading=11, textColor=muted_color))
-    styles.add(ParagraphStyle(name="Section", parent=styles["Heading1"], fontName=heading_font,
-                              fontSize=15, leading=19, textColor=primary, spaceBefore=12, spaceAfter=7,
-                              keepWithNext=True))
-    styles.add(ParagraphStyle(name="SubSection", parent=styles["Heading2"], fontName=heading_font,
-                              fontSize=10.5, leading=14, textColor=primary, spaceBefore=7, spaceAfter=4,
-                              keepWithNext=True))
+                              fontSize=8, leading=11.5, textColor=muted_color))
+    styles.add(ParagraphStyle(name="Section", parent=styles["Normal"], fontName=heading_bold,
+                              fontSize=15, leading=19, textColor=primary, spaceBefore=12, spaceAfter=7, keepWithNext=True))
+    styles.add(ParagraphStyle(name="SubSection", parent=styles["Normal"], fontName=heading_bold,
+                              fontSize=10.5, leading=14, textColor=primary, spaceBefore=10, spaceAfter=4, keepWithNext=True))
     styles.add(ParagraphStyle(name="BodySmall", parent=styles["BodyText"], fontName=body_font,
-                              fontSize=8.5, leading=12, textColor=text_color, spaceAfter=5))
+                              fontSize=8.7, leading=12.6, textColor=text_color, spaceAfter=4))
     styles.add(ParagraphStyle(name="TableText", parent=styles["BodyText"], fontName=body_font,
-                              fontSize=7.5, leading=10, textColor=text_color))
+                              fontSize=7.8, leading=10.6, textColor=text_color))
     styles.add(ParagraphStyle(name="TableHead", parent=styles["TableText"], fontName=body_bold,
                               textColor=soft_ivory))
+    styles.add(ParagraphStyle(name="Big", parent=styles["Normal"], fontName=heading_bold,
+                              fontSize=22, leading=26, textColor=primary))
+    styles.add(ParagraphStyle(name="BigLight", parent=styles["Big"], textColor=colors.white))
+    styles.add(ParagraphStyle(name="Tile", parent=styles["Normal"], fontName=body_bold,
+                              fontSize=7.5, leading=10, textColor=muted_color))
+    styles.add(ParagraphStyle(name="Tag", parent=styles["Normal"], fontName=body_bold,
+                              fontSize=6.8, leading=8, alignment=TA_CENTER))
+    styles.add(ParagraphStyle(name="CardTitle", parent=styles["Normal"], fontName=body_bold,
+                              fontSize=9.6, leading=13, textColor=primary, spaceAfter=2))
+    styles.add(ParagraphStyle(name="Heading2x", parent=styles["Normal"], fontName=heading_bold,
+                              fontSize=12, leading=16, textColor=primary))
+    styles["Heading2"].fontName = heading_bold
+    styles["Heading2"].textColor = primary
+
+    def sec(title):
+        return SectionBar(title, font=heading_bold)
+
+    def P(text, style="TableText"):
+        return Paragraph(ptext(text), styles[style])
+
+    def H(text):
+        return Paragraph("<b>%s</b>" % ptext(text), styles["TableHead"])
+
+    def card(content, stripe=accent, bg=soft_ivory, width=FW, pad=9):
+        t = Table([[content]], colWidths=[width])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), bg), ("LINEBEFORE", (0, 0), (0, -1), 3, stripe),
+            ("LEFTPADDING", (0, 0), (-1, -1), pad + 2), ("RIGHTPADDING", (0, 0), (-1, -1), pad),
+            ("TOPPADDING", (0, 0), (-1, -1), pad - 1), ("BOTTOMPADDING", (0, 0), (-1, -1), pad - 1)]))
+        return t
+
     story = []
     cfg = load_config()
     agency_name = clean_text(brand.get("agency_name") or cfg.get("agency_name")) or "Straight Up Digital"
     prepared_line = ""
     if clean_text(cfg.get("prepared_by")):
         bits = [clean_text(cfg.get(k)) for k in ("contact_email", "contact_phone", "contact_website") if clean_text(cfg.get(k))]
-        prepared_line = "<b>Prepared by:</b> " + ptext(cfg["prepared_by"]) + (" | " + ptext(" | ".join(bits)) if bits else "")
+        prepared_line = "Prepared by " + ptext(cfg["prepared_by"]) + ("  |  " + ptext("  |  ".join(bits)) if bits else "")
     business = audit.get("business_name", "Business")
     research = audit.get("website_research", {})
     score = audit.get("scorecard", {})
     ext = audit.get("external_research", {})
     keyword = audit.get("keyword_research", {})
+    assessed = score.get("assessed_score")
+
+    def score_colour(value, light_bg=True):
+        if value is None:
+            return "#687168"
+        if value >= 75:
+            return "#79B842" if light_bg else "#A8FF65"
+        if value >= 50:
+            return "#E0A800"
+        return "#C0392B" if light_bg else "#FF6B5B"
 
     root = Path(__file__).resolve().parent
+    header_logo = root / "assets" / "brand" / "straight-up-digital-logo-dark.png"
     logo_setting = (env(brand.get("logo_path_env", "CRM_PDF_LOGO_PATH"), "")
-                    or cfg.get("logo_path") or brand.get("logo_path")
-                    or "assets/brand/straight-up-digital-logo-light.png")
-    logo_path = Path(logo_setting)
-    if not logo_path.is_absolute():
-        logo_path = root / logo_path
-    if not logo_path.is_file():
-        logo_path = root / "assets" / "brand" / "straight-up-digital-logo-light.png"
-    if logo_path.is_file():
-        logo_image = Image(str(logo_path), width=72*mm, height=18*mm, kind="proportional")
-        logo_image.hAlign = "LEFT"
-        story += [logo_image, Spacer(1, 8*mm)]
-    cover_details = Table([
-        [Paragraph("<b>Website</b>", styles["TableText"]), Paragraph(ptext(audit.get("website") or "Not supplied"), styles["BodySmall"])],
-        [Paragraph("<b>Location</b>", styles["TableText"]), Paragraph(ptext(audit.get("location") or "Not supplied"), styles["BodySmall"])],
-        [Paragraph("<b>Industry</b>", styles["TableText"]), Paragraph(ptext(audit.get("industry") or "Not supplied"), styles["BodySmall"])],
-        [Paragraph("<b>Report date</b>", styles["TableText"]), Paragraph(ptext(audit.get("generated_at") or "Not supplied"), styles["BodySmall"])],
-    ], colWidths=[30*mm, 126*mm])
-    cover_details.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), soft_ivory),
-        ("LINEBEFORE", (0,0), (0,-1), 3, accent),
-        ("INNERGRID", (0,0), (-1,-1), 0.35, border_color),
-        ("BOX", (0,0), (-1,-1), 0.5, border_color),
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-        ("LEFTPADDING", (0,0), (-1,-1), 8), ("RIGHTPADDING", (0,0), (-1,-1), 8),
-        ("TOPPADDING", (0,0), (-1,-1), 6), ("BOTTOMPADDING", (0,0), (-1,-1), 2),
-    ]))
-    story += [
-        Paragraph(ptext(brand.get("cover_title", "BUSINESS GROWTH AUDIT")), styles["CoverKicker"]),
-        Paragraph("INTELLIGENCE. VISIBILITY. GROWTH.", styles["Tagline"]),
-        Spacer(1, 4*mm),
-        Paragraph(ptext(business), styles["CoverTitle"]),
-        Paragraph("A practical review of digital presence, local visibility and growth opportunities.", styles["BodyText"]),
-        Spacer(1, 8*mm), cover_details, Spacer(1, 5*mm),
-    ]
-    if prepared_line:
-        story.append(Paragraph(prepared_line, styles["Subtle"]))
-    story.append(PageBreak())
-    story.append(Paragraph("Executive summary", styles["Section"]))
-    summary_card = Table([[Paragraph(ptext(audit.get("executive_summary") or "No executive summary is available for this run."), styles["BodyText"])]], colWidths=[156*mm])
-    summary_card.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), soft_ivory),
-        ("LINEBEFORE", (0,0), (0,-1), 3, accent),
-        ("BOX", (0,0), (-1,-1), 0.5, border_color),
-        ("LEFTPADDING", (0,0), (-1,-1), 10), ("RIGHTPADDING", (0,0), (-1,-1), 10),
-        ("TOPPADDING", (0,0), (-1,-1), 9), ("BOTTOMPADDING", (0,0), (-1,-1), 9),
-    ]))
-    story += [summary_card, Spacer(1, 5*mm)]
+                    or cfg.get("logo_path") or brand.get("logo_path") or "")
+    cover_logo = Path(logo_setting) if logo_setting else header_logo
+    if not cover_logo.is_absolute():
+        cover_logo = root / cover_logo
+    if not cover_logo.is_file():
+        cover_logo = header_logo
+    # The cover is dark, so it needs the logo version made for dark backgrounds.
+    if header_logo.is_file():
+        cover_logo = header_logo
 
-    card_data = [
-        [Paragraph("<b>Assessed score</b>", styles["TableText"]),
-         Paragraph("<b>Coverage</b>", styles["TableText"]),
-         Paragraph("<b>Pages crawled</b>", styles["TableText"])],
-        [Paragraph(f"{score.get('assessed_score', 'N/A')}/100", styles["Heading2"]),
-         Paragraph(f"{score.get('assessment_coverage_percent', 0)}%", styles["Heading2"]),
-         Paragraph(str(research.get("pages_researched", 0)), styles["Heading2"])]
-    ]
-    card = Table(card_data, colWidths=[55*mm, 45*mm, 45*mm])
-    card.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), soft_ivory),
-        ("LINEBEFORE", (0,0), (0,-1), 3, accent),
-        ("BOX", (0,0), (-1,-1), 0.5, border_color),
-        ("INNERGRID", (0,0), (-1,-1), 0.4, border_color),
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-        ("LEFTPADDING", (0,0), (-1,-1), 8),
-        ("TOPPADDING", (0,0), (-1,-1), 7),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 7)
-    ]))
-    story += [card, Spacer(1, 4*mm),
+    # ---------------- cover (dark page)
+    if cover_logo.is_file():
+        logo_image = Image(str(cover_logo), width=66*mm, height=18*mm, kind="proportional")
+        logo_image.hAlign = "LEFT"
+        story += [logo_image, Spacer(1, 30*mm)]
+    story += [Paragraph("LOCAL GROWTH AUDIT", styles["CoverKicker"]),
+              Paragraph(ptext(business), styles["CoverTitle"]),
+              Paragraph("A practical review of digital presence, local visibility and growth opportunities.", styles["CoverSub"]),
+              Spacer(1, 16*mm)]
+    dial = ScoreDial(assessed, size=46*mm, track="#27302A", fill=score_colour(assessed, light_bg=False), text="#FFFFFF",
+                     sub="#8E9A92", font=heading_bold, subfont=body_font)
+    findings = len(audit.get("opportunities", []))
+    high = sum(1 for o in audit.get("opportunities", []) if o.get("priority") == "High")
+    side = Table([
+        [Paragraph("DIGITAL PRESENCE SCORE", styles["CoverLabel"])],
+        [Paragraph("Across the categories we could verify. Not a sales-performance score.", styles["CoverFine"])],
+        [Spacer(1, 3*mm)],
+        [Paragraph(f'<font color="#A8FF65"><b>{findings}</b></font> areas to improve'
+                   + (f', <font color="#FF6B5B"><b>{high}</b></font> high priority' if high else ""), styles["CoverValue"])],
+    ], colWidths=[FW - 56*mm])
+    side.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 0), ("TOPPADDING", (0, 0), (-1, -1), 1),
+                              ("BOTTOMPADDING", (0, 0), (-1, -1), 1), ("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
+    dial_row = Table([[dial, side]], colWidths=[54*mm, FW - 54*mm])
+    dial_row.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("LEFTPADDING", (0, 0), (-1, -1), 0)]))
+    story += [dial_row, Spacer(1, 14*mm)]
+    details = Table([
+        [Paragraph("WEBSITE", styles["CoverLabel"]), Paragraph(ptext(audit.get("website") or "Not supplied"), styles["CoverValue"])],
+        [Paragraph("LOCATION", styles["CoverLabel"]), Paragraph(ptext(audit.get("location") or "Not supplied"), styles["CoverValue"])],
+        [Paragraph("INDUSTRY", styles["CoverLabel"]), Paragraph(ptext(audit.get("industry") or "Not supplied"), styles["CoverValue"])],
+        [Paragraph("REPORT DATE", styles["CoverLabel"]), Paragraph(ptext(audit.get("generated_at") or "Not supplied"), styles["CoverValue"])],
+    ], colWidths=[32*mm, FW - 32*mm])
+    details.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), dark_card), ("LINEBEFORE", (0, 0), (0, -1), 3, accent),
+        ("LINEBELOW", (0, 0), (-1, -2), 0.4, colors.HexColor("#27302A")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10), ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7)]))
+    story += [details, Spacer(1, 8*mm)]
+    if prepared_line:
+        story.append(Paragraph(prepared_line, styles["CoverFine"]))
+    story.append(PageBreak())
+
+    # ---------------- executive summary
+    story.append(sec("Executive summary"))
+    story.append(Spacer(1, 2*mm))
+    story.append(card(Paragraph(ptext(audit.get("executive_summary") or "No executive summary is available for this run."), styles["BodyText"])))
+    story.append(Spacer(1, 6*mm))
+    light_dial = ScoreDial(assessed, size=40*mm, track="#E3E8E1", fill=score_colour(assessed), text="#080A09",
+                           sub="#687168", font=heading_bold, subfont=body_font)
+
+    def tile(label, value):
+        t = Table([[Paragraph(label.upper(), styles["Tile"])], [Paragraph(ptext(value), styles["Big"])]], colWidths=[(FW - 48*mm) / 3 - 2*mm])
+        t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), soft_ivory), ("LINEABOVE", (0, 0), (-1, 0), 2, accent),
+                               ("LEFTPADDING", (0, 0), (-1, -1), 7), ("TOPPADDING", (0, 0), (0, 0), 7),
+                               ("TOPPADDING", (0, 1), (0, 1), 1), ("BOTTOMPADDING", (0, 1), (0, 1), 8)]))
+        return t
+    tiles = Table([[tile("Coverage", f"{score.get('assessment_coverage_percent', 0)}%"),
+                    tile("Pages read", str(research.get("pages_researched", 0))),
+                    tile("Findings", str(findings))]], colWidths=[(FW - 48*mm) / 3] * 3)
+    tiles.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+    hero = Table([[light_dial, tiles]], colWidths=[48*mm, FW - 48*mm])
+    hero.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("LEFTPADDING", (0, 0), (-1, -1), 0)]))
+    story += [hero, Spacer(1, 2*mm),
               Paragraph("The score covers assessed categories only. Categories marked Not scored had no verified data source. It is not a sales-performance score.", styles["Subtle"])]
 
     rank = {"High": 0, "Medium": 1, "Low": 2}
     top_items = sorted(audit.get("opportunities", []), key=lambda o: rank.get(o.get("priority"), 3))[:3]
     if top_items:
-        story.append(Paragraph("Top priorities", styles["Section"]))
-        rows = []
+        story += [Spacer(1, 5*mm), Paragraph("Top priorities", styles["SubSection"])]
         for i, o in enumerate(top_items, 1):
-            rows.append([Paragraph(f"<b>{i}</b>", styles["Heading2"]),
-                         [Paragraph(f"<b>{ptext(o.get('title'))}</b>", styles["BodySmall"]),
-                          Paragraph(ptext(o.get("evidence")), styles["BodySmall"])]])
-        box = Table(rows, colWidths=[12*mm, 143*mm])
-        box.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,-1), soft_ivory),
-            ("LINEBEFORE", (0,0), (0,-1), 3, accent),
-            ("LINEBELOW", (0,0), (-1,-2), 0.4, border_color),
-            ("BOX", (0,0), (-1,-1), 0.5, border_color),
-            ("VALIGN", (0,0), (-1,-1), "TOP"),
-            ("LEFTPADDING", (0,0), (-1,-1), 8), ("TOPPADDING", (0,0), (-1,-1), 6),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 2)
-        ]))
-        story.append(box)
+            body = [priority_tag(o.get("priority"), styles["Tag"]), Spacer(1, 1.5*mm),
+                    Paragraph(ptext(o.get("title")), styles["CardTitle"]),
+                    Paragraph(ptext(o.get("evidence")), styles["BodySmall"])]
+            story += [KeepTogether([card(body, stripe=colors.HexColor(PRIORITY_COLOURS.get(o.get("priority"), ("#687168",))[0]), pad=8)]),
+                      Spacer(1, 2.5*mm)]
 
-    def bar(score, out_of, width=34*mm):
-        if score is None or not out_of:
+    # ---------------- 1. scorecard
+    def bar(value, out_of, width=40*mm):
+        if value is None or not out_of:
             return Paragraph("n/a", styles["TableText"])
-        frac = max(0.03, min(1.0, score / out_of))
+        frac = max(0.03, min(1.0, value / out_of))
         colour = "#79B842" if frac >= 0.75 else "#E0A800" if frac >= 0.5 else "#C0392B"
-        widths = [width * frac, max(width * (1 - frac), 0.2*mm)]
-        t = Table([["", ""]], colWidths=widths, rowHeights=[3.5*mm])
+        t = Table([["", ""]], colWidths=[width * frac, max(width * (1 - frac), 0.2*mm)], rowHeights=[3.2*mm])
         t.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (0,0), colors.HexColor(colour)),
-            ("BACKGROUND", (1,0), (1,0), border_color),
-            ("LEFTPADDING", (0,0), (-1,-1), 0), ("RIGHTPADDING", (0,0), (-1,-1), 0),
-            ("TOPPADDING", (0,0), (-1,-1), 0), ("BOTTOMPADDING", (0,0), (-1,-1), 0)]))
+            ("BACKGROUND", (0, 0), (0, 0), colors.HexColor(colour)),
+            ("BACKGROUND", (1, 0), (1, 0), colors.HexColor("#E3E8E1")),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
         return t
 
-    table_rows = [[Paragraph("<b>Category</b>", styles["TableHead"]),
-                   Paragraph("<b>Rating</b>", styles["TableHead"]),
-                   Paragraph("<b>Score</b>", styles["TableHead"]),
-                   Paragraph("<b>Status</b>", styles["TableHead"])]]
+    rows = [[H("Category"), H("Rating"), H("Score"), H("Status")]]
     for item in score.get("categories", []):
         value = "Not scored" if item.get("score") is None else f"{item.get('score')}/{item.get('out_of')}"
-        table_rows.append([
-            Paragraph(ptext(item.get("category")), styles["TableText"]),
-            bar(item.get("score"), item.get("out_of", 1)),
-            Paragraph(ptext(value), styles["TableText"]),
-            Paragraph(ptext(item.get("status")), styles["TableText"])
-        ])
-    score_table = Table(table_rows, colWidths=[46*mm, 38*mm, 18*mm, 53*mm], repeatRows=1)
-    score_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), primary),
-        ("TEXTCOLOR", (0,0), (-1,0), soft_ivory),
-        ("GRID", (0,0), (-1,-1), 0.35, border_color),
-        ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F7F8F5")]),
-        ("LEFTPADDING", (0,0), (-1,-1), 6), ("RIGHTPADDING", (0,0), (-1,-1), 6),
-        ("TOPPADDING", (0,0), (-1,-1), 5), ("BOTTOMPADDING", (0,0), (-1,-1), 5)
-    ]))
-    story.append(KeepTogether([Paragraph("1. Scorecard and evidence", styles["Section"]), score_table]))
+        rows.append([Paragraph(f"<b>{ptext(item.get('category'))}</b>", styles["TableText"]),
+                     bar(item.get("score"), item.get("out_of", 1)),
+                     Paragraph(f"<b>{ptext(value)}</b>", styles["TableText"]), P(item.get("status"))])
+    story.append(Spacer(1, 6*mm))
+    story.append(sec("1. Scorecard and evidence"))
+    story.append(styled_table(rows, [44*mm, 44*mm, 20*mm, FW - 108*mm], primary, border_color, pad=6))
 
-    story.append(Paragraph("Website observations", styles["SubSection"]))
-    for page in research.get("pages", [])[:12]:
-        tech = page.get("technical", {})
-        story.append(Paragraph(f"<b>{ptext(page.get('title') or page.get('url'))}</b>", styles["BodySmall"]))
-        story.append(Paragraph(f"URL: {ptext(page.get('url'))}", styles["Subtle"]))
-        story.append(Paragraph(f"Meta description: {ptext(clean_text(page.get('description') or 'Not detected')[:220])}", styles["BodySmall"]))
-        story.append(Paragraph(
-            f"Technical signals: HTTPS {tech.get('https')}; title {tech.get('title_present')}; "
-            f"meta description {tech.get('meta_description_present')}; H1 count {tech.get('h1_count')}; "
-            f"images missing alt {tech.get('images_missing_alt')}/{tech.get('image_count')}.",
-            styles["BodySmall"]
-        ))
+    pages_found = research.get("pages", [])[:12]
+    if pages_found:
+        story.append(Paragraph("Website observations", styles["SubSection"]))
+        rows = [[H("Page"), H("Meta description"), H("Technical signals")]]
+        for page in pages_found:
+            tech = page.get("technical", {})
+            rows.append([
+                [Paragraph(f"<b>{ptext(clean_text(page.get('title') or page.get('url'))[:70])}</b>", styles["TableText"]),
+                 Paragraph(ptext(clean_text(page.get("url"))[:70]), styles["Subtle"])],
+                P(clean_text(page.get("description") or "Not detected")[:200]),
+                P(f"HTTPS {'yes' if tech.get('https') else 'no'}; title {'yes' if tech.get('title_present') else 'no'}; "
+                  f"meta {'yes' if tech.get('meta_description_present') else 'no'}; H1 x{tech.get('h1_count')}; "
+                  f"alt text missing {tech.get('images_missing_alt')}/{tech.get('image_count')}")])
+        story.append(styled_table(rows, [50*mm, 66*mm, FW - 116*mm], primary, border_color))
 
-    story.append(Paragraph("2. Public web discovery: Google and reviews", styles["Section"]))
+    # ---------------- 2. discovery
+    story.append(Spacer(1, 4*mm))
+    story.append(sec("2. Public web discovery: Google and reviews"))
     story.append(Paragraph(ptext(ext.get("interpretation_note", "")), styles["BodySmall"]))
     gp = ext.get("google_places") or {}
     if gp.get("matched"):
         story.append(Paragraph(f"Verified Google listing ({ptext(google_source_label(gp))})", styles["SubSection"]))
         story.append(Paragraph(f"<b>{ptext(gp.get('name'))}</b>, {ptext(gp.get('address'))}", styles["BodySmall"]))
-        story.append(Paragraph(
-            f"Rating {ptext(gp.get('rating'))} from {ptext(gp.get('review_count'))} reviews; "
-            f"photos {'not checked' if gp.get('photo_count') is None else ptext(gp.get('photo_count'))}; category {ptext(gp.get('category') or 'n/a')}; opening hours {'not checked' if gp.get('has_hours') is None else ('listed' if gp.get('has_hours') else 'not listed')}; "
-            f"phone {'not checked' if gp.get('phone') is None else ('listed' if gp.get('phone') else 'not listed')}.", styles["BodySmall"]))
-        story.append(Paragraph(ptext(gp.get("maps_url")), styles["Subtle"]))
+        photos = "not checked" if gp.get("photo_count") is None else str(gp.get("photo_count"))
+        hours = "not checked" if gp.get("has_hours") is None else ("listed" if gp.get("has_hours") else "not listed")
+        phone = "not checked" if gp.get("phone") is None else ("listed" if gp.get("phone") else "not listed")
+        cells = [("Rating", f"{gp.get('rating')}" if gp.get("rating") is not None else "n/a"),
+                 ("Reviews", str(gp.get("review_count") if gp.get("review_count") is not None else "n/a")),
+                 ("Hours", hours), ("Phone", phone), ("Photos", photos)]
+        w = FW / len(cells)
+        stats = Table([[Paragraph(l.upper(), styles["Tile"]) for l, _ in cells],
+                       [Paragraph(f"<b>{ptext(v)}</b>", styles["Heading2x"]) for _, v in cells]], colWidths=[w] * len(cells))
+        stats.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), soft_ivory), ("LINEABOVE", (0, 0), (-1, 0), 2, accent),
+                                   ("LINEAFTER", (0, 0), (-2, -1), 0.4, border_color),
+                                   ("LEFTPADDING", (0, 0), (-1, -1), 8), ("TOPPADDING", (0, 0), (-1, 0), 6),
+                                   ("BOTTOMPADDING", (0, 1), (-1, 1), 7)]))
+        story += [stats, Spacer(1, 2*mm),
+                  Paragraph(f"Category: {ptext(gp.get('category') or 'n/a')}. {ptext(gp.get('maps_url'))}", styles["Subtle"])]
     elif gp.get("note"):
         story.append(Paragraph(ptext(gp.get("note")), styles["BodySmall"]))
     if not gp.get("matched") and ext.get("maps_search_link"):
@@ -2661,25 +3060,34 @@ def make_pdf(audit: dict) -> str:
         story.append(Paragraph(title, styles["SubSection"]))
         items = ext.get(key, [])
         if not items:
-            story.append(Paragraph("No candidate surfaced in this search pass. This does not prove absence.", styles["BodySmall"]))
-        for item in items[:8]:
-            story.append(Paragraph(f"<b>{ptext(item.get('title') or 'Search result')}</b>", styles["BodySmall"]))
-            story.append(Paragraph(ptext(item.get("url")), styles["Subtle"]))
-            if item.get("snippet"):
-                story.append(Paragraph(ptext(clean_text(item.get("snippet"))[:1000]), styles["BodySmall"]))
+            story.append(Paragraph("Nothing relevant to this business surfaced in this search pass. This does not prove absence.", styles["BodySmall"]))
+            continue
+        rows = [[H("Result"), H("What it says")]]
+        for item in items[:6]:
+            rows.append([[Paragraph(f"<b>{ptext(clean_text(item.get('title') or 'Search result')[:80])}</b>", styles["TableText"]),
+                          Paragraph(ptext(clean_text(item.get("url"))[:80]), styles["Subtle"])],
+                         P(clean_text(item.get("snippet"))[:260])])
+        story.append(styled_table(rows, [70*mm, FW - 70*mm], primary, border_color))
 
-    story.append(Paragraph("3. Competitor discovery", styles["Section"]))
+    # ---------------- 3. competitors
+    story.append(Spacer(1, 4*mm))
+    story.append(sec("3. Competitor discovery"))
     competitors = ext.get("competitor_candidates", [])
     if not competitors:
         story.append(Paragraph("No candidate surfaced, or the search provider did not return results. Do not interpret this as proof that competitors are absent.", styles["BodySmall"]))
-    for item in competitors[:8]:
-        story.append(Paragraph(f"<b>{ptext(item.get('title') or 'Search result')}</b>", styles["BodySmall"]))
-        story.append(Paragraph(ptext(item.get("url")), styles["Subtle"]))
-        if item.get("snippet"):
-            story.append(Paragraph(ptext(clean_text(item.get("snippet"))[:1000]), styles["BodySmall"]))
+    else:
+        rows = [[H("Business"), H("Website"), H("Why it is listed")]]
+        for item in competitors[:8]:
+            rows.append([P(f"{clean_text(item.get('title') or 'Search result')[:50]}"),
+                         Paragraph(ptext(clean_text(item.get("url")).replace("https://", "").replace("http://", "")[:48]), styles["Subtle"]),
+                         P(clean_text(item.get("snippet"))[:150])])
+        story.append(styled_table(rows, [42*mm, 56*mm, FW - 98*mm], primary, border_color))
+    story.append(Spacer(1, 1.5*mm))
     story.append(Paragraph("These are search candidates, not a verified market-share or competitor-quality ranking. Manually confirm service overlap, location and current activity.", styles["Subtle"]))
 
-    story.append(Paragraph("4. SEO and keyword opportunities", styles["Section"]))
+    # ---------------- 4. keywords
+    story.append(Spacer(1, 4*mm))
+    story.append(sec("4. SEO and keyword opportunities"))
     story.append(Paragraph(ptext(keyword.get("metrics_status", "")), styles["BodySmall"]))
     story.append(Paragraph("Recurring terms found in page titles, meta descriptions and headings", styles["SubSection"]))
     terms = keyword.get("recurring_terms_in_titles_meta_headings", [])
@@ -2687,14 +3095,29 @@ def make_pdf(audit: dict) -> str:
     story.append(Paragraph("Suggested seed keywords", styles["SubSection"]))
     story.append(Paragraph(ptext(", ".join(keyword.get("suggested_short_tail_keywords", []))), styles["BodySmall"]))
     story.append(Paragraph("Suggested long-tail keyword ideas (validate before use)", styles["SubSection"]))
-    for term in keyword.get("suggested_long_tail_keywords", [])[:30]:
-        story.append(Paragraph("- " + ptext(term), styles["BodySmall"]))
+    long_tail = keyword.get("suggested_long_tail_keywords", [])[:30]
+    if long_tail:
+        per = (len(long_tail) + 2) // 3
+        cols = [long_tail[i:i + per] for i in range(0, len(long_tail), per)]
+        while len(cols) < 3:
+            cols.append([])
+        grid = [[Paragraph(ptext(cols[c][r]) if r < len(cols[c]) else "", styles["TableText"]) for c in range(3)] for r in range(per)]
+        g = Table(grid, colWidths=[FW / 3] * 3)
+        g.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), soft_ivory), ("LINEBEFORE", (0, 0), (0, -1), 3, accent),
+                               ("LEFTPADDING", (0, 0), (-1, -1), 8), ("TOPPADDING", (0, 0), (-1, -1), 2.5),
+                               ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5), ("VALIGN", (0, 0), (-1, -1), "TOP")]))
+        story.append(g)
+    story.append(Spacer(1, 1.5*mm))
     story.append(Paragraph(ptext(keyword.get("next_step_for_metrics", "")), styles["Subtle"]))
 
-    story += strategy_story(audit.get("strategy") or {}, styles)
+    # ---------------- 5. strategy, redesign brief
+    story.append(Spacer(1, 4*mm))
+    story += strategy_story(audit.get("strategy") or {}, styles, sec=sec, brand_colours=(primary, border_color, accent, soft_ivory),
+                            fw=FW)
     redesign = audit.get("website_redesign_brief") or {}
     if redesign:
-        story.append(Paragraph("Website redesign brief", styles["Section"]))
+        story.append(Spacer(1, 4*mm))
+        story.append(sec("Website redesign brief"))
         story.append(Paragraph(ptext(redesign.get("brief_status", "")), styles["Subtle"]))
         story.append(Paragraph("Project goal", styles["SubSection"]))
         story.append(Paragraph(ptext(redesign.get("project_goal", "")), styles["BodySmall"]))
@@ -2705,99 +3128,124 @@ def make_pdf(audit: dict) -> str:
                              ("Evidence limits", "evidence_limits")):
             story.append(Paragraph(heading, styles["SubSection"]))
             items = redesign.get(key, [])
-            if key in ("recommended_site_map", "migration_inventory"):
+            if key == "recommended_site_map" and items:
+                rows = [[H("Page"), H("Purpose"), H("Needs")]]
                 for item in items[:12]:
-                    if key == "recommended_site_map":
-                        detail = "; ".join(item.get("content_requirements", []))
-                        story.append(Paragraph(f"<b>{ptext(item.get('page'))}</b>: {ptext(item.get('purpose'))}", styles["BodySmall"]))
-                        story.append(Paragraph(f"Requirements: {ptext(detail)}. {ptext(item.get('seo_note'))}", styles["Subtle"]))
-                    else:
-                        story.append(Paragraph(f"<b>{ptext(item.get('title') or 'Untitled page')}</b> | {ptext(item.get('url'))}", styles["BodySmall"]))
+                    rows.append([P(f"{item.get('page')}"), P(item.get("purpose")),
+                                 P("; ".join(item.get("content_requirements", [])))])
+                story.append(styled_table(rows, [34*mm, 56*mm, FW - 90*mm], primary, border_color))
+            elif key == "migration_inventory" and items:
+                rows = [[H("Page title"), H("Address")]]
+                for item in items[:12]:
+                    rows.append([P(clean_text(item.get("title") or "Untitled page")[:70]),
+                                 Paragraph(ptext(clean_text(item.get("url"))[:80]), styles["Subtle"])])
+                story.append(styled_table(rows, [70*mm, FW - 70*mm], primary, border_color))
             else:
                 for item in items[:12]:
                     story.append(Paragraph("- " + ptext(item), styles["BodySmall"]))
         story.append(Paragraph("Priority changes from audit evidence", styles["SubSection"]))
         for item in redesign.get("priority_changes", [])[:8]:
-            story.append(Paragraph(f"<b>[{ptext(item.get('priority'))}] {ptext(item.get('finding'))}</b>", styles["BodySmall"]))
-            story.append(Paragraph(f"Evidence: {ptext(item.get('evidence'))}", styles["Subtle"]))
-            story.append(Paragraph(f"Recommendation: {ptext(item.get('recommended_change'))}", styles["BodySmall"]))
-    story.append(Paragraph("6. Prioritised action plan", styles["Section"]))
+            story.append(KeepTogether([
+                Paragraph(f"<b>[{ptext(item.get('priority'))}] {ptext(item.get('finding'))}</b>", styles["BodySmall"]),
+                Paragraph(f"Evidence: {ptext(item.get('evidence'))}", styles["Subtle"]),
+                Paragraph(f"Recommendation: {ptext(item.get('recommended_change'))}", styles["BodySmall"])]))
+
+    # ---------------- 6. action plan
+    story.append(Spacer(1, 4*mm))
+    story.append(sec("6. Prioritised action plan"))
+    story.append(Spacer(1, 2*mm))
     for i, item in enumerate(audit.get("opportunities", []), 1):
-        block = [
-            Paragraph(f"{i}. [{ptext(item.get('priority'))}] {ptext(item.get('title'))}", styles["SubSection"]),
-            Paragraph(f"<b>Evidence:</b> {ptext(item.get('evidence'))}", styles["BodySmall"]),
-            Paragraph(f"<b>Recommended action:</b> {ptext(item.get('action'))}", styles["BodySmall"]),
-            Paragraph(f"<b>Potential service fit:</b> {ptext(item.get('service_fit'))}", styles["Subtle"])
-        ]
-        story.append(KeepTogether(block))
+        stripe = colors.HexColor(PRIORITY_COLOURS.get(item.get("priority"), ("#687168",))[0])
+        body = [priority_tag(item.get("priority"), styles["Tag"]), Spacer(1, 1.5*mm),
+                Paragraph(f"{i}. {ptext(item.get('title'))}", styles["CardTitle"]),
+                Paragraph(f"<b>Evidence:</b> {ptext(item.get('evidence'))}", styles["BodySmall"]),
+                Paragraph(f"<b>Recommended action:</b> {ptext(item.get('action'))}", styles["BodySmall"]),
+                Paragraph(f"Potential service fit: {ptext(item.get('service_fit'))}", styles["Subtle"])]
+        story += [KeepTogether([card(body, stripe=stripe, pad=8)]), Spacer(1, 2.5*mm)]
 
-    story.append(Paragraph("7. Suggested 90-day roadmap", styles["Section"]))
+    # ---------------- 7. roadmap
+    story.append(Spacer(1, 3*mm))
+    story.append(sec("7. Suggested 90-day roadmap"))
+    story.append(Spacer(1, 2*mm))
     roadmap = [
-        ("Days 1 to 14: Verify", "Confirm the exact business identity, Google profile, review-platform listings, key competitors and current enquiry journey. Fix factual inconsistencies first."),
-        ("Days 15 to 30: Remove friction", "Prioritise one or two website/contact improvements, make core services and service area clear, and ensure contact options work on mobile."),
-        ("Days 31 to 60: Build relevance", "Improve the highest-value service page, add genuine project proof and validate keyword targets using real search data where available."),
-        ("Days 61 to 90: Measure and refine", "Track agreed KPIs such as qualified enquiries, calls, form submissions, Search Console clicks and review requests. Establish a baseline before claiming growth.")
-    ]
-    for heading, body in roadmap:
-        story.append(Paragraph(heading, styles["SubSection"]))
-        story.append(Paragraph(body, styles["BodySmall"]))
+        ("DAYS 1-14", "Verify", "Confirm the exact business identity, Google profile, review-platform listings, key competitors and current enquiry journey. Fix factual inconsistencies first."),
+        ("DAYS 15-30", "Remove friction", "Prioritise one or two website/contact improvements, make core services and service area clear, and ensure contact options work on mobile."),
+        ("DAYS 31-60", "Build relevance", "Improve the highest-value page, add genuine proof and validate keyword targets using real search data where available."),
+        ("DAYS 61-90", "Measure and refine", "Track agreed KPIs such as qualified enquiries, calls, form submissions, Search Console clicks and review requests. Establish a baseline before claiming growth.")]
+    road = Table([[[Paragraph(f'<font color="#A8FF65"><b>{a}</b></font>', styles["TableText"]),
+                    Paragraph(f'<font color="#FFFFFF"><b>{ptext(b)}</b></font>', styles["CardTitle"])],
+                   Paragraph(ptext(c), styles["BodySmall"])] for a, b, c in roadmap], colWidths=[40*mm, FW - 40*mm])
+    road.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), primary), ("LINEBELOW", (0, 0), (-1, -2), 0.6, colors.white),
+        ("BACKGROUND", (1, 0), (1, -1), soft_ivory), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 9), ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+        ("TOPPADDING", (0, 0), (-1, -1), 8), ("BOTTOMPADDING", (0, 0), (-1, -1), 6)]))
+    story.append(road)
 
+    # ---------------- 8. quote
     package = audit.get("package_suggestion", {})
-    story.append(Paragraph("8. One-off quote and optional monthly support", styles["Section"]))
+    story.append(Spacer(1, 4*mm))
+    story.append(sec("8. One-off quote and optional monthly support"))
+    story.append(Spacer(1, 2*mm))
     if package.get("estimated_price_zar") is not None:
         points = package.get("points_to_recover")
         if points is not None:
-            story.append(Paragraph(
-                f"<b>One-off score-gap quote: {ptext(points)} points × R{ptext(package.get('rate_zar_per_point'))} = R{ptext(package.get('estimated_price_zar'))}</b>",
-                styles["Heading2"]))
-            if package.get("score") is not None:
-                story.append(Paragraph(f"Current assessed score: {package.get('score')}/{package.get('maximum_points')}. Each point is R{package.get('rate_zar_per_point')}.", styles["BodySmall"]))
-            for item in package.get("line_items", []):
-                story.append(Paragraph(f"{ptext(item.get('category'))}: {item.get('points_to_recover')} points × R{item.get('rate_zar_per_point')} = R{item.get('estimated_price_zar')}", styles["BodySmall"]))
+            hero_left = [Paragraph("ONE-OFF SCORE-GAP QUOTE", styles["CoverLabel"]),
+                         Paragraph(f'<font color="#A8FF65">R{ptext(package.get("estimated_price_zar"))}</font>', styles["BigLight"]),
+                         Paragraph(f'{ptext(points)} points x R{ptext(package.get("rate_zar_per_point"))} per point', styles["CoverFine"])]
+            sub = (f"Current assessed score {package.get('score')}/{package.get('maximum_points')}. Each point is R{package.get('rate_zar_per_point')}."
+                   if package.get("score") is not None else "")
+            hero_right = Paragraph(ptext(sub), styles["CoverFine"])
+            price = Table([[hero_left, hero_right]], colWidths=[FW * 0.55, FW * 0.45])
+            price.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), primary), ("LINEBEFORE", (0, 0), (0, -1), 3, accent),
+                                       ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("LEFTPADDING", (0, 0), (-1, -1), 12),
+                                       ("RIGHTPADDING", (0, 0), (-1, -1), 12), ("TOPPADDING", (0, 0), (-1, -1), 11),
+                                       ("BOTTOMPADDING", (0, 0), (-1, -1), 11)]))
+            story.append(price)
+            items = package.get("line_items", [])
+            if items:
+                rows = [[H("Where the points are"), H("Points"), H("Amount")]]
+                for item in items:
+                    rows.append([P(item.get("category")), P(str(item.get("points_to_recover"))), P(f"R{item.get('estimated_price_zar')}")])
+                rows.append([Paragraph("<b>Total</b>", styles["TableText"]), Paragraph(f"<b>{ptext(points)}</b>", styles["TableText"]),
+                             Paragraph(f"<b>R{ptext(package.get('estimated_price_zar'))}</b>", styles["TableText"])])
+                t = styled_table(rows, [FW - 50*mm, 24*mm, 26*mm], primary, border_color)
+                t.setStyle(TableStyle([("LINEABOVE", (0, -1), (-1, -1), 1, primary)]))
+                story += [Spacer(1, 3*mm), t]
         else:
-            story.append(Paragraph(f"<b>Once-off website build: R{ptext(package.get('website_build_once_off_zar'))}</b>", styles["Heading2"]))
+            story.append(Paragraph(f"<b>Once-off website build: R{ptext(package.get('website_build_once_off_zar'))}</b>", styles["Heading2x"]))
             story.append(Paragraph(f"Hosting: R{ptext(package.get('website_hosting_monthly_zar'))}/month, billed separately.", styles["BodySmall"]))
-        story.append(Paragraph(ptext(package.get("guardrail", "")), styles["Subtle"]))
+        story += [Spacer(1, 2*mm), Paragraph(ptext(package.get("guardrail", "")), styles["Subtle"])]
 
     retainers = package.get("monthly_retainer_options") or monthly_retainer_options(audit)
     story.append(Paragraph("Optional monthly support retainers", styles["SubSection"]))
+    rows = [[H("Plan"), H("Per month"), H("What is included")]]
     for plan in retainers.get("plans", []):
-        story.append(Paragraph(f"<b>{ptext(plan.get('name'))}: R{plan.get('price_zar_month')}/month</b>", styles["BodySmall"]))
-        for item in plan.get("scope", []):
-            story.append(Paragraph("- " + ptext(item), styles["BodySmall"]))
+        rows.append([Paragraph(f"<b>{ptext(plan.get('name'))}</b>", styles["TableText"]),
+                     Paragraph(f"<b>R{plan.get('price_zar_month')}</b>", styles["TableText"]),
+                     P("  |  ".join(plan.get("scope", [])))])
+    story.append(styled_table(rows, [34*mm, 24*mm, FW - 58*mm], primary, border_color, pad=6))
     story.append(Paragraph("Recommended ongoing priorities from this audit", styles["SubSection"]))
     for item in retainers.get("audit_based_priorities", []):
         story.append(Paragraph("- " + ptext(item), styles["BodySmall"]))
     story.append(Paragraph(ptext(retainers.get("selection_note", "")), styles["Subtle"]))
     story.append(Paragraph(ptext(retainers.get("larger_scope_note", "")), styles["Subtle"]))
 
-    story.append(Paragraph("9. Measurement plan", styles["Section"]))
-    kpis = [
-        ["Measure", "Baseline needed", "Review frequency"],
-        ["Qualified enquiries", "Calls, emails and forms tagged consistently", "Monthly"],
-        ["Website organic visibility", "Google Search Console impressions/clicks, if access granted", "Monthly"],
-        ["Conversion rate", "Enquiries divided by an agreed traffic measure", "Monthly, once tracking works"],
-        ["Public reviews", "Verified platform, rating, count, latest date", "Monthly"],
-        ["Delivery progress", "Completed tasks vs agreed scope", "Monthly"]
-    ]
-    kpi_rows = [[Paragraph(("<b>%s</b>" % ptext(c)) if i == 0 else ptext(c),
-                           styles["TableHead" if i == 0 else "TableText"]) for c in row]
-                for i, row in enumerate(kpis)]
-    kpi_table = Table(kpi_rows, colWidths=[43*mm, 80*mm, 32*mm], repeatRows=1)
-    kpi_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), primary),
-        ("TEXTCOLOR", (0,0), (-1,0), soft_ivory),
-        ("GRID", (0,0), (-1,-1), 0.35, border_color),
-        ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F7F8F5")]),
-        ("LEFTPADDING", (0,0), (-1,-1), 5), ("RIGHTPADDING", (0,0), (-1,-1), 5),
-        ("TOPPADDING", (0,0), (-1,-1), 5), ("BOTTOMPADDING", (0,0), (-1,-1), 5)
-    ]))
-    story.append(kpi_table)
+    # ---------------- 9, 10
+    story.append(Spacer(1, 4*mm))
+    story.append(sec("9. Measurement plan"))
+    kpis = [["Measure", "Baseline needed", "Review frequency"],
+            ["Qualified enquiries", "Calls, emails and forms tagged consistently", "Monthly"],
+            ["Website organic visibility", "Google Search Console impressions/clicks, if access granted", "Monthly"],
+            ["Conversion rate", "Enquiries divided by an agreed traffic measure", "Monthly, once tracking works"],
+            ["Public reviews", "Verified platform, rating, count, latest date", "Monthly"],
+            ["Delivery progress", "Completed tasks vs agreed scope", "Monthly"]]
+    rows = [[H(c) if i == 0 else P(c) for c in row] for i, row in enumerate(kpis)]
+    story.append(styled_table(rows, [46*mm, FW - 78*mm, 32*mm], primary, border_color))
 
-    story.append(Paragraph("10. Scope, assumptions and limitations", styles["Section"]))
-    limitations = audit.get("limitations", [])
-    for limitation in limitations:
+    story.append(Spacer(1, 4*mm))
+    story.append(sec("10. Scope, assumptions and limitations"))
+    for limitation in audit.get("limitations", []):
         story.append(Paragraph("- " + ptext(limitation), styles["BodySmall"]))
     story.append(Paragraph("Source register", styles["SubSection"]))
     story.append(Paragraph("Website pages crawled during this run are listed below. Public search result links are listed in the discovery sections. Search snippets can be stale or ambiguous, so direct verification is required before making claims to the business owner.", styles["BodySmall"]))
@@ -2805,40 +3253,45 @@ def make_pdf(audit: dict) -> str:
         story.append(Paragraph(ptext(page.get("url")), styles["Subtle"]))
 
     footer_text = clean_text(brand.get("footer_text")) or f"{agency_name} | Evidence-led audit"
-    header_logo = root / "assets" / "brand" / "straight-up-digital-logo-dark.png"
 
-    def page_footer(canvas, document):
+    def page_decor(canvas, document):
         canvas.saveState()
         if document.page == 1:
+            canvas.setFillColor(primary)
+            canvas.rect(0, 0, A4[0], A4[1], stroke=0, fill=1)
             canvas.setFillColor(accent)
-            canvas.rect(0, A4[1]-3*mm, A4[0], 3*mm, stroke=0, fill=1)
+            canvas.rect(0, A4[1] - 4*mm, A4[0], 4*mm, stroke=0, fill=1)
+            canvas.setFillColor(colors.HexColor("#0F1411"))
+            canvas.circle(A4[0] - 18*mm, 52*mm, 62*mm, stroke=0, fill=1)
+            canvas.setFillColor(accent)
+            canvas.rect(0, 0, A4[0], 2*mm, stroke=0, fill=1)
         else:
             canvas.setFillColor(primary)
-            canvas.rect(0, A4[1]-9*mm, A4[0], 9*mm, stroke=0, fill=1)
+            canvas.rect(0, A4[1] - 11*mm, A4[0], 11*mm, stroke=0, fill=1)
             canvas.setFillColor(accent)
-            canvas.rect(0, A4[1]-9*mm, 2.5*mm, 9*mm, stroke=0, fill=1)
+            canvas.rect(0, A4[1] - 11*mm, 2.5*mm, 11*mm, stroke=0, fill=1)
             if header_logo.is_file():
-                canvas.drawImage(str(header_logo), 18*mm, A4[1]-8.5*mm, width=34*mm, height=8.3*mm,
+                canvas.drawImage(str(header_logo), left_m, A4[1] - 9.8*mm, width=34*mm, height=8.6*mm,
                                  preserveAspectRatio=True, mask="auto")
             canvas.setFont(body_bold, 7)
             canvas.setFillColor(soft_ivory)
-            canvas.drawRightString(A4[0]-18*mm, A4[1]-5.8*mm, "BUSINESS GROWTH AUDIT")
-        canvas.setStrokeColor(accent)
-        canvas.setLineWidth(0.8)
-        canvas.line(18*mm, 13*mm, A4[0]-18*mm, 13*mm)
-        canvas.setFont(body_font, 7)
-        canvas.setFillColor(muted_color)
-        canvas.drawString(18*mm, 8*mm, footer_text)
-        if brand.get("show_draft_notice", True) and audit.get("draft_notice"):
-            canvas.setFont(body_bold, 7)
-            canvas.setFillColor(colors.HexColor("#C0392B"))
-            canvas.drawCentredString(A4[0] / 2, 8*mm, clean_text(audit["draft_notice"]))
-            canvas.setFillColor(muted_color)
+            canvas.drawRightString(A4[0] - right_m, A4[1] - 6.4*mm, clean_text(business).upper()[:48] + "  |  GROWTH AUDIT")
+            canvas.setStrokeColor(border_color)
+            canvas.setLineWidth(0.5)
+            canvas.line(left_m, 13*mm, A4[0] - right_m, 13*mm)
             canvas.setFont(body_font, 7)
-        canvas.drawRightString(A4[0]-18*mm, 8*mm, f"Page {document.page}")
+            canvas.setFillColor(muted_color)
+            canvas.drawString(left_m, 8*mm, footer_text)
+            if brand.get("show_draft_notice", True) and audit.get("draft_notice"):
+                canvas.setFont(body_bold, 7)
+                canvas.setFillColor(colors.HexColor("#C0392B"))
+                canvas.drawCentredString(A4[0] / 2, 8*mm, clean_text(audit["draft_notice"]))
+                canvas.setFillColor(muted_color)
+                canvas.setFont(body_font, 7)
+            canvas.drawRightString(A4[0] - right_m, 8*mm, f"Page {document.page}")
         canvas.restoreState()
 
-    build_pdf_safely(lambda: doc.build(story, onFirstPage=page_footer, onLaterPages=page_footer), attempts=2)
+    build_pdf_safely(lambda: doc.build(story, onFirstPage=page_decor, onLaterPages=page_decor), attempts=2)
     return str(path)
 
 
@@ -2942,6 +3395,8 @@ def sweep_competitor_leads(industry: str, town: str, own_domains: set, limit: in
             d = domain_of(url)
             if not d or d in own_domains or any(h in d for h in DIRECTORY_HOSTS) or d.endswith("wixsite.com"):
                 continue
+            if is_chain(lead.get("business_name"), d):
+                continue
             reviews = lead.get("review_count") or 0
             try:
                 reviews = int(reviews)
@@ -2949,8 +3404,8 @@ def sweep_competitor_leads(industry: str, town: str, own_domains: set, limit: in
                 reviews = 0
             if d not in best or reviews > best[d][0]:
                 best[d] = (reviews, {"title": clean_text(lead.get("business_name")) or d, "url": url,
-                                     "snippet": f"Same trade in {clean_text(data.get('town'))} from your town sweep (Google Maps)"
-                                                + (f", {reviews} Google reviews" if reviews else ""),
+                                     "snippet": f"Another {(clean_text(industry).split(',')[0] or 'local business').lower()} in {clean_text(data.get('town'))}, found on Google Maps"
+                                                + (f" ({reviews} Google reviews)" if reviews else ""),
                                      "query": "town_sweep"})
     ranked = sorted(best.values(), key=lambda x: -x[0])
     return [c for _, c in ranked[:limit]]
@@ -3012,7 +3467,12 @@ def run_audit(website: str, business_name: str = "", location: str = "", industr
     if not website_research.get("success"):
         if website_research.get("robots_blocked_count"):
             raise RuntimeError("This site's robots.txt asks automated tools not to crawl it, so no pages were read. The audit stopped out of respect for that.")
-        raise RuntimeError("No readable HTML pages were collected. The site may block automated requests, be down, or build its content with JavaScript.")
+        why = website_research.get("first_failure") or ""
+        if why.startswith("HTTP 404") or why.startswith("HTTP 410"):
+            raise RuntimeError(f"The website address returned {why[5:]} (page not found). The site may have been taken down or the address on file is wrong. Check the link in a browser and update it on the contact.")
+        if why.startswith("HTTP 403") or why.startswith("HTTP 429") or why.startswith("HTTP 5"):
+            raise RuntimeError(f"The website refused or failed the request ({why}). It may block automated tools or be down. Try again later or review it by hand.")
+        raise RuntimeError("No readable HTML pages were collected" + (f" ({why})" if why else "") + ". The site may block automated requests, be down, or build its content with JavaScript.")
     js = bool(website_research.get("js_rendered_suspected"))
 
     name_supplied = bool(clean_text(business_name))
@@ -3059,6 +3519,8 @@ def run_audit(website: str, business_name: str = "", location: str = "", industr
         site = clean_text(other.get("website"))
         if not site or domain in site.lower() or any(d in site.lower() for d in DIRECTORY_HOSTS):
             continue
+        if is_chain(other.get("name"), site):
+            continue
         try:
             maps_leads.append({"title": clean_text(other.get("name")) or domain_of(site), "url": normalize_input_url(site),
                                "snippet": "Nearby business returned by the Google Maps lookup (a lead to verify)",
@@ -3077,6 +3539,8 @@ def run_audit(website: str, business_name: str = "", location: str = "", industr
         external["competitor_candidates"] = sweep_leads + [c for c in external.get("competitor_candidates", [])
                                                            if c.get("url") not in have]
         external["competitor_source"] = "town sweep"
+    external["competitor_candidates"] = dedupe_competitors(
+        [c for c in external.get("competitor_candidates", []) if domain_of(c.get("url", "")) not in own_domains])
 
     step("Scoring the digital presence")
     keywords = extract_keywords(website_research, business_name, location, industry)

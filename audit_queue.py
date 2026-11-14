@@ -33,7 +33,9 @@ def _run_one(job_id:str,tenant_id:str,contact_id:int,db_path:Path):
         audit["prompt_policy_name"]=prompt_bundle.get("name")
         audit["package_suggestion"]["monthly_retainer_options"]=monthly_retainer_options(audit)
         pdf=Path(make_pdf(audit))
-        backend=storage_backend(env("CRM_LOCAL_STORAGE_DIR","reports/objects"))
+        store_dir=Path(env("CRM_LOCAL_STORAGE_DIR","reports/objects"))
+        if not store_dir.is_absolute():store_dir=Path(__file__).resolve().parent/store_dir
+        backend=storage_backend(str(store_dir))
         stored=backend.put(f"audits/{tenant_id}/{pdf.name}",pdf.read_bytes())
         audit["pdf_report_path"]=stored
         save_audit_result(contact_id,audit,db_path,tenant_id)
