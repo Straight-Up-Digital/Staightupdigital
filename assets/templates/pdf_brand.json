@@ -1,11 +1,14 @@
 {
   "agency_name": "Straight Up Digital",
-  "primary_color": "#101010",
-  "accent_color": "#F04A0A",
-  "text_color": "#202020",
-  "muted_color": "#666666",
+  "primary_color": "#080A09",
+  "accent_color": "#A8FF65",
+  "text_color": "#252B27",
+  "muted_color": "#687168",
+  "soft_ivory": "#F2F4EF",
+  "border_color": "#D9DED8",
+  "logo_path": "assets/brand/straight-up-digital-logo-light.png",
   "logo_path_env": "CRM_PDF_LOGO_PATH",
-  "cover_title": "LOCAL BUSINESS GROWTH AUDIT",
-  "footer_text": "Straight Up Digital | Evidence-led audit",
+  "cover_title": "BUSINESS AUDITOR | LOCAL GROWTH AUDIT",
+  "footer_text": "Straight Up Digital | Evidence-led growth audit",
   "show_draft_notice": true
 }

@@ -1,4 +1,4 @@
-﻿# Python environments
+# Python environments
 .venv/
 venv/
 env/
@@ -19,6 +19,10 @@ Serp Api Key.txt
 # Business data and generated reports
 reports/
 backups/
+/outputs/
+/.work/
+/.manus/
+/.manus-*.tmp
 /auditor_config.json
 /status_report.txt
 

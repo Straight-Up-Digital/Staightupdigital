@@ -57,6 +57,8 @@ try:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import mm
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
     from reportlab.platypus import (
         SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image,
         PageBreak, KeepTogether
@@ -99,10 +101,10 @@ _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = {
     "agency_name": "Straight Up Digital",
-    "brand_color": "#101010",
-    "accent_color": "#F04A0A",
-    "logo_path": "C:\\Users\\Saint\\Straight Up Digital\\straight-up-digital-logo-pngs\\02-lockup-horizontal\\lockup-light-bg-1000w.png",
-    "crm_logo_path": "C:\\Users\\Saint\\Straight Up Digital\\straight-up-digital-logo-pngs\\02-lockup-horizontal\\lockup-dark-bg-1000w.png",
+    "brand_color": "#080A09",
+    "accent_color": "#A8FF65",
+    "logo_path": "assets/brand/straight-up-digital-logo-light.png",
+    "crm_logo_path": "assets/brand/straight-up-digital-logo-dark.png",
     "prepared_by": "",
     "contact_email": "",
     "contact_phone": "",
@@ -1778,6 +1780,8 @@ def detect_services(research: dict, business_name: str, industry: str = "") -> l
             return
         if REVIEW_BLURB_RE.search(t) or PHOTO_CAPTION_RE.search(t):
             return
+        if re.match(r"^(room|suite|unit|chalet|cabin|villa|apartment|flat)\s*\d+$", low):
+            return
         if low not in [x[0].lower() for x in found]:
             found.append((t, source))
 
@@ -2213,6 +2217,10 @@ def strategy_opportunities(st: dict) -> list:
 def strategy_story(st: dict, styles) -> list:
     if not st:
         return []
+    brand = pdf_template()
+    table_primary = colors.HexColor(brand.get("primary_color", "#080A09"))
+    table_border = colors.HexColor(brand.get("border_color", "#D9DED8"))
+    table_row = colors.HexColor("#F7F8F5")
     out = [Paragraph("5. Content and local SEO strategy", styles["Section"]),
            Paragraph(ptext(st.get("demand_note", "")), styles["BodySmall"])]
 
@@ -2222,10 +2230,10 @@ def strategy_story(st: dict, styles) -> list:
     def table(rows, widths):
         t = Table(rows, colWidths=widths, repeatRows=1)
         t.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#17324D")),
-            ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D5DEE7")),
+            ("BACKGROUND", (0, 0), (-1, 0), table_primary),
+            ("GRID", (0, 0), (-1, -1), 0.35, table_border),
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7F9FB")]),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, table_row]),
             ("LEFTPADDING", (0, 0), (-1, -1), 5), ("RIGHTPADDING", (0, 0), (-1, -1), 5),
             ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
         return t
@@ -2385,7 +2393,36 @@ def build_redesign_brief(research: dict, strategy: dict, keywords: dict,
             "Search volume, rankings, conversions and traffic are not measured here.",
             "Confirm business facts, service areas, testimonials, imagery and legal copy with the client before build or publication.",
         ],
+}
+
+
+def _register_brand_pdf_fonts() -> tuple[str, str, str]:
+    """Register bundled brand fonts, falling back to built-in PDF fonts if unavailable."""
+    if not REPORTLAB_AVAILABLE:
+        return "Helvetica", "Helvetica-Bold", "Helvetica-Bold"
+    font_dir = Path(__file__).resolve().parent / "assets" / "brand" / "fonts"
+    files = {
+        "Inter": font_dir / "Inter-Regular.ttf",
+        "Inter-Bold": font_dir / "Inter-Bold.ttf",
+        "Montserrat": font_dir / "Montserrat-SemiBold.ttf",
+        "Montserrat-Bold": font_dir / "Montserrat-Bold.ttf",
     }
+    if not all(path.is_file() for path in files.values()):
+        return "Helvetica", "Helvetica-Bold", "Helvetica-Bold"
+    try:
+        registered = set(pdfmetrics.getRegisteredFontNames())
+        for name, path in files.items():
+            if name not in registered:
+                pdfmetrics.registerFont(TTFont(name, str(path)))
+        pdfmetrics.registerFontFamily(
+            "Inter", normal="Inter", bold="Inter-Bold", italic="Inter", boldItalic="Inter-Bold"
+        )
+        pdfmetrics.registerFontFamily(
+            "Montserrat", normal="Montserrat", bold="Montserrat-Bold", italic="Montserrat", boldItalic="Montserrat-Bold"
+        )
+        return "Inter", "Inter-Bold", "Montserrat"
+    except Exception:
+        return "Helvetica", "Helvetica-Bold", "Helvetica-Bold"
 
 
 def make_pdf(audit: dict) -> str:
@@ -2397,29 +2434,53 @@ def make_pdf(audit: dict) -> str:
 
     doc = SimpleDocTemplate(
         str(path), pagesize=A4, rightMargin=18*mm, leftMargin=18*mm,
-        topMargin=17*mm, bottomMargin=17*mm, title=f"{audit.get('business_name')} Growth Audit",
+        topMargin=21*mm, bottomMargin=18*mm, title=f"{audit.get('business_name')} Growth Audit",
         author=APP_NAME
     )
     styles = getSampleStyleSheet()
     brand = pdf_template()
-    primary = colors.HexColor(brand.get("primary_color", "#101010"))
-    accent = colors.HexColor(brand.get("accent_color", "#F04A0A"))
-    styles.add(ParagraphStyle(name="CoverTitle", parent=styles["Title"], fontName="Helvetica-Bold",
-                              fontSize=23, leading=28, alignment=TA_LEFT, textColor=primary,
+    primary = colors.HexColor(brand.get("primary_color", "#080A09"))
+    accent = colors.HexColor(brand.get("accent_color", "#A8FF65"))
+    text_color = colors.HexColor(brand.get("text_color", "#252B27"))
+    muted_color = colors.HexColor(brand.get("muted_color", "#687168"))
+    soft_ivory = colors.HexColor(brand.get("soft_ivory", "#F2F4EF"))
+    border_color = colors.HexColor(brand.get("border_color", "#D9DED8"))
+    body_font, body_bold, heading_font = _register_brand_pdf_fonts()
+    styles["Normal"].fontName = body_font
+    styles["Normal"].textColor = text_color
+    styles["BodyText"].fontName = body_font
+    styles["BodyText"].textColor = text_color
+    styles["BodyText"].fontSize = 9
+    styles["BodyText"].leading = 13
+    styles["Title"].fontName = heading_font
+    styles["Heading1"].fontName = heading_font
+    styles["Heading1"].textColor = primary
+    styles["Heading2"].fontName = heading_font
+    styles["Heading2"].textColor = primary
+    styles.add(ParagraphStyle(name="CoverTitle", parent=styles["Title"], fontName=heading_font,
+                              fontSize=25, leading=31, alignment=TA_LEFT, textColor=primary,
                               spaceAfter=10))
-    styles.add(ParagraphStyle(name="Subtle", parent=styles["Normal"], fontSize=8, leading=11,
-                              textColor=colors.HexColor("#5B6573")))
-    styles.add(ParagraphStyle(name="Section", parent=styles["Heading1"], fontSize=15, leading=19,
-                              textColor=primary, spaceBefore=12, spaceAfter=7))
-    styles.add(ParagraphStyle(name="SubSection", parent=styles["Heading2"], fontSize=10.5, leading=14,
-                              textColor=accent, spaceBefore=7, spaceAfter=4))
-    styles.add(ParagraphStyle(name="BodySmall", parent=styles["BodyText"], fontSize=8.5, leading=12, spaceAfter=5))
-    styles.add(ParagraphStyle(name="TableText", parent=styles["BodyText"], fontSize=7.5, leading=10))
-    styles.add(ParagraphStyle(name="TableHead", parent=styles["TableText"], textColor=colors.white))
+    styles.add(ParagraphStyle(name="CoverKicker", parent=styles["Normal"], fontName=body_bold,
+                              fontSize=8, leading=11, textColor=muted_color, spaceAfter=3))
+    styles.add(ParagraphStyle(name="Tagline", parent=styles["Normal"], fontName=body_bold,
+                              fontSize=8.5, leading=12, textColor=primary, spaceAfter=5))
+    styles.add(ParagraphStyle(name="Subtle", parent=styles["Normal"], fontName=body_font,
+                              fontSize=8, leading=11, textColor=muted_color))
+    styles.add(ParagraphStyle(name="Section", parent=styles["Heading1"], fontName=heading_font,
+                              fontSize=15, leading=19, textColor=primary, spaceBefore=12, spaceAfter=7,
+                              keepWithNext=True))
+    styles.add(ParagraphStyle(name="SubSection", parent=styles["Heading2"], fontName=heading_font,
+                              fontSize=10.5, leading=14, textColor=primary, spaceBefore=7, spaceAfter=4,
+                              keepWithNext=True))
+    styles.add(ParagraphStyle(name="BodySmall", parent=styles["BodyText"], fontName=body_font,
+                              fontSize=8.5, leading=12, textColor=text_color, spaceAfter=5))
+    styles.add(ParagraphStyle(name="TableText", parent=styles["BodyText"], fontName=body_font,
+                              fontSize=7.5, leading=10, textColor=text_color))
+    styles.add(ParagraphStyle(name="TableHead", parent=styles["TableText"], fontName=body_bold,
+                              textColor=soft_ivory))
     story = []
     cfg = load_config()
     agency_name = clean_text(brand.get("agency_name") or cfg.get("agency_name")) or "Straight Up Digital"
-    footer_name = agency_name
     prepared_line = ""
     if clean_text(cfg.get("prepared_by")):
         bits = [clean_text(cfg.get(k)) for k in ("contact_email", "contact_phone", "contact_website") if clean_text(cfg.get(k))]
@@ -2430,29 +2491,55 @@ def make_pdf(audit: dict) -> str:
     ext = audit.get("external_research", {})
     keyword = audit.get("keyword_research", {})
 
-    logo_path = Path(env("CRM_PDF_LOGO_PATH", cfg.get("logo_path", "")))
+    root = Path(__file__).resolve().parent
+    logo_setting = (env(brand.get("logo_path_env", "CRM_PDF_LOGO_PATH"), "")
+                    or cfg.get("logo_path") or brand.get("logo_path")
+                    or "assets/brand/straight-up-digital-logo-light.png")
+    logo_path = Path(logo_setting)
+    if not logo_path.is_absolute():
+        logo_path = root / logo_path
+    if not logo_path.is_file():
+        logo_path = root / "assets" / "brand" / "straight-up-digital-logo-light.png"
     if logo_path.is_file():
         logo_image = Image(str(logo_path), width=72*mm, height=18*mm, kind="proportional")
         logo_image.hAlign = "LEFT"
-        story += [logo_image, Spacer(1, 4*mm)]
+        story += [logo_image, Spacer(1, 8*mm)]
+    cover_details = Table([
+        [Paragraph("<b>Website</b>", styles["TableText"]), Paragraph(ptext(audit.get("website") or "Not supplied"), styles["BodySmall"])],
+        [Paragraph("<b>Location</b>", styles["TableText"]), Paragraph(ptext(audit.get("location") or "Not supplied"), styles["BodySmall"])],
+        [Paragraph("<b>Industry</b>", styles["TableText"]), Paragraph(ptext(audit.get("industry") or "Not supplied"), styles["BodySmall"])],
+        [Paragraph("<b>Report date</b>", styles["TableText"]), Paragraph(ptext(audit.get("generated_at") or "Not supplied"), styles["BodySmall"])],
+    ], colWidths=[30*mm, 126*mm])
+    cover_details.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), soft_ivory),
+        ("LINEBEFORE", (0,0), (0,-1), 3, accent),
+        ("INNERGRID", (0,0), (-1,-1), 0.35, border_color),
+        ("BOX", (0,0), (-1,-1), 0.5, border_color),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("LEFTPADDING", (0,0), (-1,-1), 8), ("RIGHTPADDING", (0,0), (-1,-1), 8),
+        ("TOPPADDING", (0,0), (-1,-1), 6), ("BOTTOMPADDING", (0,0), (-1,-1), 2),
+    ]))
     story += [
-        Spacer(1, 18*mm),
-        Paragraph(ptext(agency_name.upper()), styles["Subtle"]),
-        Paragraph("BUSINESS GROWTH AUDIT", styles["Subtle"]),
-        Spacer(1, 3*mm),
+        Paragraph(ptext(brand.get("cover_title", "BUSINESS GROWTH AUDIT")), styles["CoverKicker"]),
+        Paragraph("INTELLIGENCE. VISIBILITY. GROWTH.", styles["Tagline"]),
+        Spacer(1, 4*mm),
         Paragraph(ptext(business), styles["CoverTitle"]),
-        Paragraph("Digital presence, local visibility, website content and growth opportunities", styles["Heading2"]),
-        Spacer(1, 7*mm),
-        Paragraph(f"<b>Website:</b> {ptext(audit.get('website'))}", styles["BodyText"]),
-        Paragraph(f"<b>Location:</b> {ptext(audit.get('location') or 'Not supplied')}", styles["BodyText"]),
-        Paragraph(f"<b>Industry:</b> {ptext(audit.get('industry') or 'Not supplied')}", styles["BodyText"]),
-        Paragraph(f"<b>Report generated:</b> {ptext(audit.get('generated_at'))}", styles["BodyText"]),
-        Paragraph(prepared_line, styles["BodyText"]),
-        Spacer(1, 10*mm),
-        Paragraph("Executive summary", styles["Section"]),
-        Paragraph(ptext(audit.get("executive_summary", "")), styles["BodyText"]),
-        Spacer(1, 5*mm)
+        Paragraph("A practical review of digital presence, local visibility and growth opportunities.", styles["BodyText"]),
+        Spacer(1, 8*mm), cover_details, Spacer(1, 5*mm),
     ]
+    if prepared_line:
+        story.append(Paragraph(prepared_line, styles["Subtle"]))
+    story.append(PageBreak())
+    story.append(Paragraph("Executive summary", styles["Section"]))
+    summary_card = Table([[Paragraph(ptext(audit.get("executive_summary") or "No executive summary is available for this run."), styles["BodyText"])]], colWidths=[156*mm])
+    summary_card.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), soft_ivory),
+        ("LINEBEFORE", (0,0), (0,-1), 3, accent),
+        ("BOX", (0,0), (-1,-1), 0.5, border_color),
+        ("LEFTPADDING", (0,0), (-1,-1), 10), ("RIGHTPADDING", (0,0), (-1,-1), 10),
+        ("TOPPADDING", (0,0), (-1,-1), 9), ("BOTTOMPADDING", (0,0), (-1,-1), 9),
+    ]))
+    story += [summary_card, Spacer(1, 5*mm)]
 
     card_data = [
         [Paragraph("<b>Assessed score</b>", styles["TableText"]),
@@ -2464,9 +2551,10 @@ def make_pdf(audit: dict) -> str:
     ]
     card = Table(card_data, colWidths=[55*mm, 45*mm, 45*mm])
     card.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#F1F5F8")),
-        ("BOX", (0,0), (-1,-1), 0.5, colors.HexColor("#D5DEE7")),
-        ("INNERGRID", (0,0), (-1,-1), 0.4, colors.HexColor("#D5DEE7")),
+        ("BACKGROUND", (0,0), (-1,-1), soft_ivory),
+        ("LINEBEFORE", (0,0), (0,-1), 3, accent),
+        ("BOX", (0,0), (-1,-1), 0.5, border_color),
+        ("INNERGRID", (0,0), (-1,-1), 0.4, border_color),
         ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
         ("LEFTPADDING", (0,0), (-1,-1), 8),
         ("TOPPADDING", (0,0), (-1,-1), 7),
@@ -2486,9 +2574,10 @@ def make_pdf(audit: dict) -> str:
                           Paragraph(ptext(o.get("evidence")), styles["BodySmall"])]])
         box = Table(rows, colWidths=[12*mm, 143*mm])
         box.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#F1F5F8")),
-            ("LINEBELOW", (0,0), (-1,-2), 0.4, colors.HexColor("#D5DEE7")),
-            ("BOX", (0,0), (-1,-1), 0.5, colors.HexColor("#D5DEE7")),
+            ("BACKGROUND", (0,0), (-1,-1), soft_ivory),
+            ("LINEBEFORE", (0,0), (0,-1), 3, accent),
+            ("LINEBELOW", (0,0), (-1,-2), 0.4, border_color),
+            ("BOX", (0,0), (-1,-1), 0.5, border_color),
             ("VALIGN", (0,0), (-1,-1), "TOP"),
             ("LEFTPADDING", (0,0), (-1,-1), 8), ("TOPPADDING", (0,0), (-1,-1), 6),
             ("BOTTOMPADDING", (0,0), (-1,-1), 2)
@@ -2496,15 +2585,15 @@ def make_pdf(audit: dict) -> str:
         story.append(box)
 
     def bar(score, out_of, width=34*mm):
-        if score is None:
+        if score is None or not out_of:
             return Paragraph("n/a", styles["TableText"])
         frac = max(0.03, min(1.0, score / out_of))
-        colour = "#2E8B57" if frac >= 0.75 else "#E0A800" if frac >= 0.5 else "#C0392B"
+        colour = "#79B842" if frac >= 0.75 else "#E0A800" if frac >= 0.5 else "#C0392B"
         widths = [width * frac, max(width * (1 - frac), 0.2*mm)]
         t = Table([["", ""]], colWidths=widths, rowHeights=[3.5*mm])
         t.setStyle(TableStyle([
             ("BACKGROUND", (0,0), (0,0), colors.HexColor(colour)),
-            ("BACKGROUND", (1,0), (1,0), colors.HexColor("#E3E9EF")),
+            ("BACKGROUND", (1,0), (1,0), border_color),
             ("LEFTPADDING", (0,0), (-1,-1), 0), ("RIGHTPADDING", (0,0), (-1,-1), 0),
             ("TOPPADDING", (0,0), (-1,-1), 0), ("BOTTOMPADDING", (0,0), (-1,-1), 0)]))
         return t
@@ -2523,11 +2612,11 @@ def make_pdf(audit: dict) -> str:
         ])
     score_table = Table(table_rows, colWidths=[46*mm, 38*mm, 18*mm, 53*mm], repeatRows=1)
     score_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#17324D")),
-        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-        ("GRID", (0,0), (-1,-1), 0.35, colors.HexColor("#D5DEE7")),
+        ("BACKGROUND", (0,0), (-1,0), primary),
+        ("TEXTCOLOR", (0,0), (-1,0), soft_ivory),
+        ("GRID", (0,0), (-1,-1), 0.35, border_color),
         ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F7F9FB")]),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F7F8F5")]),
         ("LEFTPADDING", (0,0), (-1,-1), 6), ("RIGHTPADDING", (0,0), (-1,-1), 6),
         ("TOPPADDING", (0,0), (-1,-1), 5), ("BOTTOMPADDING", (0,0), (-1,-1), 5)
     ]))
@@ -2696,11 +2785,11 @@ def make_pdf(audit: dict) -> str:
                 for i, row in enumerate(kpis)]
     kpi_table = Table(kpi_rows, colWidths=[43*mm, 80*mm, 32*mm], repeatRows=1)
     kpi_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#17324D")),
-        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-        ("GRID", (0,0), (-1,-1), 0.35, colors.HexColor("#D5DEE7")),
+        ("BACKGROUND", (0,0), (-1,0), primary),
+        ("TEXTCOLOR", (0,0), (-1,0), soft_ivory),
+        ("GRID", (0,0), (-1,-1), 0.35, border_color),
         ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F7F9FB")]),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F7F8F5")]),
         ("LEFTPADDING", (0,0), (-1,-1), 5), ("RIGHTPADDING", (0,0), (-1,-1), 5),
         ("TOPPADDING", (0,0), (-1,-1), 5), ("BOTTOMPADDING", (0,0), (-1,-1), 5)
     ]))
@@ -2715,17 +2804,37 @@ def make_pdf(audit: dict) -> str:
     for page in research.get("pages", []):
         story.append(Paragraph(ptext(page.get("url")), styles["Subtle"]))
 
+    footer_text = clean_text(brand.get("footer_text")) or f"{agency_name} | Evidence-led audit"
+    header_logo = root / "assets" / "brand" / "straight-up-digital-logo-dark.png"
+
     def page_footer(canvas, document):
         canvas.saveState()
-        canvas.setStrokeColor(colors.HexColor("#D5DEE7"))
+        if document.page == 1:
+            canvas.setFillColor(accent)
+            canvas.rect(0, A4[1]-3*mm, A4[0], 3*mm, stroke=0, fill=1)
+        else:
+            canvas.setFillColor(primary)
+            canvas.rect(0, A4[1]-9*mm, A4[0], 9*mm, stroke=0, fill=1)
+            canvas.setFillColor(accent)
+            canvas.rect(0, A4[1]-9*mm, 2.5*mm, 9*mm, stroke=0, fill=1)
+            if header_logo.is_file():
+                canvas.drawImage(str(header_logo), 18*mm, A4[1]-8.5*mm, width=34*mm, height=8.3*mm,
+                                 preserveAspectRatio=True, mask="auto")
+            canvas.setFont(body_bold, 7)
+            canvas.setFillColor(soft_ivory)
+            canvas.drawRightString(A4[0]-18*mm, A4[1]-5.8*mm, "BUSINESS GROWTH AUDIT")
+        canvas.setStrokeColor(accent)
+        canvas.setLineWidth(0.8)
         canvas.line(18*mm, 13*mm, A4[0]-18*mm, 13*mm)
-        canvas.setFont("Helvetica", 7)
-        canvas.setFillColor(colors.HexColor("#5B6573"))
-        canvas.drawString(18*mm, 8*mm, f"{footer_name} | Evidence-led audit")
-        if audit.get("draft_notice"):
+        canvas.setFont(body_font, 7)
+        canvas.setFillColor(muted_color)
+        canvas.drawString(18*mm, 8*mm, footer_text)
+        if brand.get("show_draft_notice", True) and audit.get("draft_notice"):
+            canvas.setFont(body_bold, 7)
             canvas.setFillColor(colors.HexColor("#C0392B"))
-            canvas.drawCentredString(A4[0] / 2, 8*mm, audit["draft_notice"])
-            canvas.setFillColor(colors.HexColor("#5B6573"))
+            canvas.drawCentredString(A4[0] / 2, 8*mm, clean_text(audit["draft_notice"]))
+            canvas.setFillColor(muted_color)
+            canvas.setFont(body_font, 7)
         canvas.drawRightString(A4[0]-18*mm, 8*mm, f"Page {document.page}")
         canvas.restoreState()
 
@@ -2802,6 +2911,88 @@ def build_sales_brief(audit: dict, cfg: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Competitors from your own town sweep, redirect detection, name consistency
+# ---------------------------------------------------------------------------
+def sweep_competitor_leads(industry: str, town: str, own_domains: set, limit: int = 5) -> list:
+    """Use the saved town sweep (Google Maps data) as the competitor source. It costs no searches and
+    avoids the directory-only results that web search returns for trades like guest houses."""
+    sweep_dir = REPORT_DIR / "sweeps"
+    try:
+        files = sorted(sweep_dir.glob("town-sweep-*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
+    except Exception:
+        return []
+    want = clean_text(industry).lower()
+    town_l = clean_text(town).lower()
+    best = {}
+    for f in files[:6]:
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if town_l and clean_text(data.get("town")).lower() != town_l:
+            continue
+        for lead in data.get("leads", []):
+            url = clean_text(lead.get("website_url"))
+            if lead.get("website_detail") != "own_website_listed" or not url:
+                continue
+            blob = " ".join([clean_text(lead.get("sector")), " ".join(lead.get("categories") or [])]).lower()
+            if want and want not in blob and not any(w in blob for w in want.split() if len(w) > 4):
+                continue
+            d = domain_of(url)
+            if not d or d in own_domains or any(h in d for h in DIRECTORY_HOSTS) or d.endswith("wixsite.com"):
+                continue
+            reviews = lead.get("review_count") or 0
+            try:
+                reviews = int(reviews)
+            except (TypeError, ValueError):
+                reviews = 0
+            if d not in best or reviews > best[d][0]:
+                best[d] = (reviews, {"title": clean_text(lead.get("business_name")) or d, "url": url,
+                                     "snippet": f"Same trade in {clean_text(data.get('town'))} from your town sweep (Google Maps)"
+                                                + (f", {reviews} Google reviews" if reviews else ""),
+                                     "query": "town_sweep"})
+    ranked = sorted(best.values(), key=lambda x: -x[0])
+    return [c for _, c in ranked[:limit]]
+
+
+def redirect_info(requested_url: str, research: dict) -> dict:
+    """Report when the address that was asked for is not the address that was crawled."""
+    pages = research.get("pages") or []
+    if not pages:
+        return {}
+    asked = (domain_of(requested_url) or "").removeprefix("www.")
+    got_url = pages[0].get("url", "")
+    got = (domain_of(got_url) or "").removeprefix("www.")
+    if not asked or not got or asked == got:
+        return {}
+    return {"requested_domain": asked, "crawled_domain": got, "crawled_url": got_url,
+            "hosted_builder": any(k in got for k in ("wixsite.com", "wix.com", "squarespace.com", "weebly.com", "godaddysites.com", "business.site", "myshopify.com"))}
+
+
+def name_mismatch(research: dict, listing: dict):
+    g = listing or {}
+    listed = clean_text(g.get("name")) if g.get("matched") else ""
+    own = site_display_name(research)
+    if listed and own:
+        a, b = norm_name(listed), norm_name(own)
+        if a and b and a != b and a not in b and b not in a:
+            return listed, own
+    return None
+
+
+def apply_score_penalty(score: dict, category: str, points: int) -> None:
+    """Take points off one category and keep the totals consistent."""
+    for c in score.get("categories", []):
+        if c["category"] == category and c.get("score") is not None:
+            take = min(points, c["score"])
+            c["score"] -= take
+            score["points_earned"] = score.get("points_earned", 0) - take
+            mx = score.get("points_assessed") or 0
+            score["assessed_score"] = round(score["points_earned"] / mx * 100) if mx else score.get("assessed_score")
+            return
+
+
 def run_audit(website: str, business_name: str = "", location: str = "", industry: str = "",
               generate_pdf: bool = True, google_manual: dict | None = None,
               nearby_towns: str = "", competitor_crawl: bool = True, competitor_urls: str = "",
@@ -2824,6 +3015,7 @@ def run_audit(website: str, business_name: str = "", location: str = "", industr
         raise RuntimeError("No readable HTML pages were collected. The site may block automated requests, be down, or build its content with JavaScript.")
     js = bool(website_research.get("js_rendered_suspected"))
 
+    name_supplied = bool(clean_text(business_name))
     business_name = clean_text(business_name) or infer_business_name(website_research, website)
     location = clean_text(location) or website_research.get("location_guess", "")
     industry = clean_text(industry)
@@ -2842,6 +3034,8 @@ def run_audit(website: str, business_name: str = "", location: str = "", industr
                 listing = places
     if not industry and listing.get("matched") and listing.get("category"):
         industry = listing["category"]
+    if not name_supplied and listing.get("matched") and clean_text(listing.get("name")):
+        business_name = clean_text(listing["name"])   # the Google name is cleaner than a page title
 
     step("Searching the web for competitors and reviews")
     external = search_research(business_name, location, industry, domain)
@@ -2875,18 +3069,45 @@ def run_audit(website: str, business_name: str = "", location: str = "", industr
         have = {c.get("url") for c in external.get("competitor_candidates", [])}
         external["competitor_candidates"] = external.get("competitor_candidates", []) + [m for m in maps_leads if m["url"] not in have]
 
+    redirect = redirect_info(website, website_research)
+    own_domains = {domain, redirect.get("crawled_domain", "")} - {""}
+    sweep_leads = sweep_competitor_leads(industry, town, own_domains)
+    if sweep_leads:
+        have = {c.get("url") for c in sweep_leads}
+        external["competitor_candidates"] = sweep_leads + [c for c in external.get("competitor_candidates", [])
+                                                           if c.get("url") not in have]
+        external["competitor_source"] = "town sweep"
+
     step("Scoring the digital presence")
     keywords = extract_keywords(website_research, business_name, location, industry)
     score = score_presence(website_research, external.get("google_places"), industry)
+    mismatch = name_mismatch(website_research, external.get("google_places"))
+    if mismatch:
+        apply_score_penalty(score, "Business identity clarity", 4)
     comp_sites = []
     if competitor_crawl:
         step("Reviewing competitor websites")
         comp_sites = crawl_competitors(external.get("competitor_candidates", []), domain, 3, 6)
+        comp_sites = [c for c in comp_sites if c["domain"] not in own_domains]
     step("Checking sitemap, robots.txt and AI readiness")
     extras = site_extras(website_research["start_url"])
     step("Building the strategy and content briefs")
     strategy = build_strategy(website_research, business_name, town, industry, external, comp_sites, extras, nearby_towns)
     opportunities = build_opportunities(website_research, score, external, keywords) + strategy_opportunities(strategy)
+    builder_site = bool(redirect.get("hosted_builder"))
+    if redirect:
+        opportunities.insert(0, {
+            "priority": "High" if builder_site else "Medium", "title": "The domain redirects to another address",
+            "evidence": (f"{redirect['requested_domain']} redirects to {redirect['crawled_domain']}, so this audit measured "
+                         f"{redirect['crawled_url']}." + (" That is an address on a website builder's own domain." if builder_site else "")),
+            "action": ("Check that the business's own domain shows the site directly and is the address search engines "
+                       "and customers see. Confirm which address is meant to be the main one before fixing anything else."),
+            "service_fit": "Domain and hosting set-up"})
+    if builder_site:
+        for o in opportunities:
+            if o["title"] == "Fix on-page SEO basics" and "builder" not in o["evidence"]:
+                o["evidence"] += (" This site is on a website builder, which can hide headings from basic crawlers. "
+                                  "Open a page in a browser and confirm before reporting the missing headings to the owner.")
     if js:
         opportunities = [o for o in opportunities if o["title"] not in CONTENT_DEPENDENT]
         opportunities.append({
@@ -2909,6 +3130,7 @@ def run_audit(website: str, business_name: str = "", location: str = "", industr
         f"It identified {len(opportunities)} areas to validate or improve, including {high_count} marked high priority. "
         + (f"Google listing details and ratings came from the {google_source_label(listing)}. " if listing.get("matched")
            else "Google profile quality and public review ratings/counts were not verified. ")
+        + (f"Note: {redirect['requested_domain']} redirects to {redirect['crawled_domain']}, and that is what was audited. " if redirect else "")
         + "Keyword search volume and actual search rankings were not measured."
         + (" Because the site appears to build its content with JavaScript, the website findings are unreliable until that is checked." if js else "")
     )
@@ -2933,12 +3155,13 @@ def run_audit(website: str, business_name: str = "", location: str = "", industr
         "website_research": website_research, "external_research": external,
         "keyword_research": keywords, "scorecard": score, "strategy": strategy,
         "opportunities": opportunities, "package_suggestion": package,
-        "limitations": limitations, "confidence": conf,
+        "limitations": limitations, "confidence": conf, "redirect": redirect,
         "data_sources": {
             "website_crawl": f"{website_research.get('pages_researched', 0)} page(s) read" + (" (looks JavaScript-rendered)" if js else ""),
             "google_listing": listing.get("status"), "google_listing_from_cache": bool(listing.get("from_cache")),
             "web_search": "ok" if web_ok else "no results (search may be rate limited)",
             "competitor_sites_reviewed": len(comp_sites),
+            "competitor_source": external.get("competitor_source", "web search"),
             "sitemap_found": bool(extras.get("sitemap_found")), "robots_txt_found": bool(extras.get("robots_found"))},
         "draft_notice": "DRAFT: verify before sending" if conf["level"] == "Low" else ""
     }

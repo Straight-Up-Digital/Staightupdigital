@@ -26,7 +26,13 @@ PROJECT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = PROJECT_DIR / "auditor_config.json"
 FINDER_DIR = PROJECT_DIR / "reports" / "finder"
 RANK_DIR = PROJECT_DIR / "reports" / "rankings"
-LOCKUP = Path(r"C:\Users\Saint\Straight Up Digital\straight-up-digital-logo-pngs\02-lockup-horizontal\lockup-dark-bg-1000w.png")
+BRAND_DIR = PROJECT_DIR / "assets" / "brand"
+BRAND_FONT_DIR = BRAND_DIR / "fonts"
+BRAND_FONT_FILES = {name.lower(): BRAND_FONT_DIR / name for name in (
+    "Inter-Regular.ttf", "Inter-SemiBold.ttf", "Inter-Bold.ttf",
+    "Montserrat-Regular.ttf", "Montserrat-SemiBold.ttf", "Montserrat-Bold.ttf",
+)}
+LOCKUP = BRAND_DIR / "straight-up-digital-logo-dark.png"
 LEAD_STAGES = ["new", "contacted", "quoted", "accepted", "live", "lost"]
 LEAD_STATUSES = ["new", "contacted", "qualified", "proposal_sent", "active_client", "not_interested", "do_not_contact"]
 WEBSITE_STATUSES = ["website_found_in_search_unverified", "no_website_surfaced_in_search", "unknown"]
@@ -144,34 +150,40 @@ def pricing() -> dict:
 # ---------------------------------------------------------------- look and feel
 
 CSS = """
+@font-face{font-family:Inter;src:url('/brand-font/inter-regular.ttf') format('truetype');font-weight:400;font-style:normal;font-display:swap}
+@font-face{font-family:Inter;src:url('/brand-font/inter-semibold.ttf') format('truetype');font-weight:600;font-style:normal;font-display:swap}
+@font-face{font-family:Inter;src:url('/brand-font/inter-bold.ttf') format('truetype');font-weight:700;font-style:normal;font-display:swap}
+@font-face{font-family:Montserrat;src:url('/brand-font/montserrat-regular.ttf') format('truetype');font-weight:400;font-style:normal;font-display:swap}
+@font-face{font-family:Montserrat;src:url('/brand-font/montserrat-semibold.ttf') format('truetype');font-weight:600;font-style:normal;font-display:swap}
+@font-face{font-family:Montserrat;src:url('/brand-font/montserrat-bold.ttf') format('truetype');font-weight:700;font-style:normal;font-display:swap}
 :root{
-  --ink:#101114;--ink-2:#3b4048;--muted:#6a717c;--bg:#eff1f3;--panel:#fff;--line:#dde0e5;--line-2:#eceef1;
-  --signal:#f04a0a;--signal-d:#c93a05;--signal-soft:#fff0e9;
+  --ink:#252B27;--ink-2:#414A43;--muted:#687168;--bg:#F2F4EF;--panel:#fff;--line:#D9DED8;--line-2:#E9ECE7;
+  --signal:#A8FF65;--signal-d:#79B842;--signal-soft:#EEF9E6;
   --ok:#0e7a5a;--ok-soft:#e2f3ec;--warn:#9a5b00;--warn-soft:#fff2d4;--bad:#b3261e;--bad-soft:#fce8e6;--info:#1d4f91;--info-soft:#e5eefa;
-  --rail:#101114;
-  --display:"Bahnschrift","Segoe UI Variable Display","Segoe UI",system-ui,sans-serif;
-  --body:"Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,sans-serif;
+  --rail:#080A09;
+  --display:"Montserrat","Segoe UI",system-ui,sans-serif;
+  --body:"Inter","Segoe UI",system-ui,-apple-system,sans-serif;
 }
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 var(--body);font-variant-numeric:tabular-nums}
-a{color:var(--ink);text-decoration-color:#b9bec7;text-underline-offset:2px}
-a:hover{text-decoration-color:var(--signal)}
+a{color:var(--ink);text-decoration-color:#aeb7ad;text-underline-offset:2px}
+a:hover{text-decoration-color:#6f9f3a}
 h1,h2,h3{font-family:var(--display);margin:0;font-weight:600;letter-spacing:-.01em}
 h1{font-size:28px;line-height:1.15}
 h2{font-size:17px}
 h3{font-size:14px}
 .app{display:grid;grid-template-columns:232px minmax(0,1fr);min-height:100vh}
-.rail{background:var(--rail);color:#c9ccd2;position:sticky;top:0;height:100vh;padding:22px 14px 16px;display:flex;flex-direction:column;gap:26px}
+.rail{background:var(--rail);color:#c9cec8;position:sticky;top:0;height:100vh;padding:22px 14px 16px;display:flex;flex-direction:column;gap:26px}
 .logo{width:100%;max-width:190px;height:auto;display:block;padding:0 6px}
 .wordmark{font-family:var(--display);font-weight:700;font-size:19px;color:#fff;padding:0 8px;letter-spacing:-.01em}
 .nav{display:flex;flex-direction:column;gap:2px}
-.nav a{display:flex;align-items:center;gap:11px;padding:9px 10px;border-radius:7px;color:#aeb2ba;text-decoration:none;font-weight:600}
+.nav a{display:flex;align-items:center;gap:11px;padding:9px 10px;border-radius:7px;color:#b4bbb4;text-decoration:none;font-weight:600}
 .nav a:hover{background:#1a1c20;color:#fff}
-.nav a.on{background:#1a1c20;color:#fff;box-shadow:inset 3px 0 0 var(--signal)}
+.nav a.on{background:rgba(168,255,101,.12);color:#F2F4EF;box-shadow:inset 3px 0 0 var(--signal)}
 .ic{width:18px;height:18px;flex:none}
 .rail-foot{margin-top:auto;font-size:12px;color:#7b818c;padding:0 8px;line-height:1.5}
-.rail-foot b{color:#b4b8c0;font-weight:600}
+.rail-foot b{color:var(--signal);font-weight:700;letter-spacing:.05em}
 .main{padding:28px 34px 70px;max-width:1560px;width:100%;min-width:0}
 .head{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;margin-bottom:22px;flex-wrap:wrap}
 .head p{margin:4px 0 0;color:var(--muted);max-width:62ch}
@@ -186,16 +198,16 @@ h3{font-size:14px}
 .note{color:var(--muted);font-size:13px;margin:0 0 12px;max-width:70ch}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:9px 15px;border-radius:7px;border:1px solid #cdd1d8;background:#fff;color:var(--ink);font:inherit;font-weight:650;cursor:pointer;text-decoration:none;line-height:1.2}
 .btn:hover{background:#f6f7f9;border-color:#b9bec7}
-.btn.primary{background:var(--signal);border-color:var(--signal);color:#fff}
-.btn.primary:hover{background:var(--signal-d);border-color:var(--signal-d)}
+.btn.primary{background:var(--signal);border-color:var(--signal);color:var(--ink)}
+.btn.primary:hover{background:#96ED55;border-color:#96ED55}
 .btn.dark{background:var(--ink);border-color:var(--ink);color:#fff}
 .btn.dark:hover{background:#262a30}
 .btn.sm{padding:5px 10px;font-size:13px}
 .btn.block{width:100%}
 .btn:disabled{opacity:.45;cursor:not-allowed}
-:focus-visible{outline:2px solid var(--signal);outline-offset:2px}
+:focus-visible{outline:2px solid var(--ink);outline-offset:2px;box-shadow:0 0 0 3px var(--signal)}
 input,select,textarea{font:inherit;padding:8px 10px;border:1px solid #cdd1d8;border-radius:6px;background:#fff;color:var(--ink);max-width:100%}
-input:focus,select:focus,textarea:focus{outline:2px solid rgba(240,74,10,.35);border-color:var(--signal)}
+input:focus,select:focus,textarea:focus{outline:2px solid rgba(37,43,39,.18);border-color:#79B842}
 input[readonly]{background:#f3f4f6;color:var(--ink-2)}
 textarea{width:100%;min-height:84px;resize:vertical}
 .pill{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;font-weight:650;background:#eceef1;color:#454b55;white-space:nowrap;line-height:1.7}
@@ -203,7 +215,7 @@ textarea{width:100%;min-height:84px;resize:vertical}
 .pill.warn{background:var(--warn-soft);color:var(--warn)}
 .pill.bad{background:var(--bad-soft);color:var(--bad)}
 .pill.info{background:var(--info-soft);color:var(--info)}
-.pill.accent{background:var(--signal-soft);color:var(--signal-d)}
+.pill.accent{background:var(--signal-soft);color:#35551F}
 .pill.dark{background:var(--ink);color:#fff}
 .muted{color:var(--muted);overflow-wrap:anywhere}
 .small{font-size:12.5px}
@@ -218,7 +230,7 @@ textarea{width:100%;min-height:84px;resize:vertical}
 .today-row b a{text-decoration:none}
 .empty{padding:14px 0;color:var(--muted)}
 .mrr{background:var(--ink);color:#fff;border-color:var(--ink)}
-.mrr .big{font:700 44px/1 var(--display);letter-spacing:-.02em;color:#fff}
+.mrr .big{font:700 44px/1 var(--display);letter-spacing:-.02em;color:var(--signal)}
 .mrr .big small{font-size:16px;font-weight:500;color:#9aa0ab;margin-left:6px}
 .mrr p{color:#9aa0ab;margin:8px 0 0}
 .finder-links{display:flex;flex-direction:column;gap:10px;margin-top:6px}
@@ -239,7 +251,7 @@ textarea{width:100%;min-height:84px;resize:vertical}
 .chip{display:inline-flex;gap:7px;align-items:center;padding:5px 11px;border:1px solid var(--line);background:#fff;border-radius:999px;text-decoration:none;font-weight:600;font-size:13px;color:var(--ink-2)}
 .chip b{font-weight:700;color:var(--ink)}
 .chip:hover{border-color:#b9bec7}
-.chip.on{background:var(--ink);border-color:var(--ink);color:#fff}
+.chip.on{background:var(--ink);border-color:var(--ink);color:var(--signal)}
 .chip.on b{color:#fff}
 .filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
 .filters input[type=search]{flex:1;min-width:220px}
@@ -292,7 +304,7 @@ tbody tr:last-child td{border-bottom:0}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f7f8fa;padding:12px;border-radius:7px;font-size:12px}
 .src-links a{display:block;overflow-wrap:anywhere;margin:5px 0}
 .job{display:flex;gap:10px;align-items:flex-start}
-.dot{width:10px;height:10px;border-radius:50%;background:var(--signal);margin-top:6px;flex:none;animation:pulse 1.2s ease-in-out infinite}
+.dot{width:10px;height:10px;border-radius:50%;background:#79B842;margin-top:6px;flex:none;animation:pulse 1.2s ease-in-out infinite}
 @keyframes pulse{50%{opacity:.25}}
 @media (prefers-reduced-motion:reduce){.dot{animation:none}}
 .log{font:12px/1.5 Consolas,ui-monospace,monospace;color:var(--ink-2);margin:8px 0 0;background:#f7f8fa;border-radius:7px;padding:10px 12px;max-height:150px;overflow:auto}
@@ -302,7 +314,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f7f8fa;padding:12px;
 @media (max-width:860px){
   .app{grid-template-columns:minmax(0,1fr)}
   .rail{position:static;height:auto;flex-direction:row;align-items:center;flex-wrap:wrap;padding:12px 14px;gap:12px}
-  .logo{max-width:130px}.nav{flex-direction:row;flex-wrap:wrap}.rail-foot{display:none}
+  .logo{max-width:130px}.nav{flex-direction:row;flex-wrap:nowrap;overflow-x:auto;max-width:100%}.nav a{white-space:nowrap}.rail-foot{display:none}
   .main{padding:20px 16px 60px}
   .stages{grid-template-columns:repeat(3,minmax(0,1fr))}
 }
@@ -345,9 +357,9 @@ def layout(title: str, body: str, active: str = "leads", message: str = "", refr
         flash = f'<div class="flash{" warn" if warn else ""}" role="status">{h(message)}</div>'
     meta = f'<meta http-equiv="refresh" content="{int(refresh)}">' if refresh else ""
     doc = (f'<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
-           f'<title>{h(title)} | Straight Up Digital CRM</title>{meta}<style>{CSS}</style></head><body><div class="app">'
+           f'<link rel="icon" type="image/png" href="/brand-favicon"><title>{h(title)} | Straight Up Digital Business Auditor CRM</title>{meta}<style>{CSS}</style></head><body><div class="app">'
            f'<aside class="rail">{brand}<nav class="nav">{nav}</nav>'
-           f'<div class="rail-foot"><b>Local CRM</b><br>{HOST}:{PORT}<br>{h(tenant_id())}</div></aside>'
+           f'<div class="rail-foot"><b>BUSINESS AUDITOR</b><br>INTELLIGENCE. VISIBILITY. GROWTH.<br>{HOST}:{PORT}<br>{h(tenant_id())}</div></aside>'
            f'<main class="main">{flash}{body}</main></div><script>{JS}</script></body></html>')
     return doc.encode("utf-8")
 
@@ -916,10 +928,24 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/suppression":
             return self.send_body(200, suppression_page(params.get("message", "")))
         if path == "/brand-logo":
-            logo = Path(config().get("crm_logo_path", str(LOCKUP)))
+            logo = Path(config().get("crm_logo_path") or str(LOCKUP))
+            if not logo.is_absolute():
+                logo = PROJECT_DIR / logo
+            if not logo.is_file():
+                logo = LOCKUP
             if logo.is_file():
                 return self.send_body(200, logo.read_bytes(), "image/png")
             return self.send_body(404, b"Logo not found", "text/plain; charset=utf-8")
+        if path == "/brand-favicon":
+            favicon = BRAND_DIR / "favicon-256.png"
+            if favicon.is_file():
+                return self.send_body(200, favicon.read_bytes(), "image/png")
+            return self.send_body(404, b"Favicon not found", "text/plain; charset=utf-8")
+        if path.startswith("/brand-font/"):
+            font = BRAND_FONT_FILES.get(path.rsplit("/", 1)[-1].lower())
+            if font and font.is_file():
+                return self.send_body(200, font.read_bytes(), "font/ttf")
+            return self.send_body(404, b"Font not found", "text/plain; charset=utf-8")
         if path.startswith("/contact/"):
             try:
                 body, _refresh = profile_page(int(path.rsplit("/", 1)[1]), params.get("message", ""))
