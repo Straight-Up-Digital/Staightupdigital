@@ -80,6 +80,8 @@ CREATE TABLE IF NOT EXISTS audit_history (
     summary_json TEXT NOT NULL DEFAULT '{}',
     full_audit_json TEXT NOT NULL DEFAULT '{}',
     scope_items_json TEXT NOT NULL DEFAULT '[]',
+    client_report_url TEXT NOT NULL DEFAULT '',
+    client_report_published_at TEXT NOT NULL DEFAULT '',
     FOREIGN KEY(contact_id) REFERENCES contacts(id)
 );
 CREATE INDEX IF NOT EXISTS idx_audit_history_contact ON audit_history(contact_id, audit_date DESC);
@@ -135,7 +137,7 @@ def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE contacts ADD COLUMN {name} {declaration}")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_place_id ON contacts(place_id) WHERE place_id IS NOT NULL AND place_id <> ''")
     history_cols={row[1] for row in conn.execute("PRAGMA table_info(audit_history)")}
-    for name,declaration in {"full_audit_json":"TEXT NOT NULL DEFAULT '{}'","scope_items_json":"TEXT NOT NULL DEFAULT '[]'"}.items():
+    for name,declaration in {"full_audit_json":"TEXT NOT NULL DEFAULT '{}'","scope_items_json":"TEXT NOT NULL DEFAULT '[]'","client_report_url":"TEXT NOT NULL DEFAULT ''","client_report_published_at":"TEXT NOT NULL DEFAULT ''"}.items():
         if name not in history_cols: conn.execute(f"ALTER TABLE audit_history ADD COLUMN {name} {declaration}")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_contacts_town_stage ON contacts(town, pipeline_stage)")
     conn.commit()
@@ -236,6 +238,27 @@ def audit_history(contact_id: int, db_path: str | Path = DEFAULT_DB, tenant_id: 
     for row in rows:
         item=dict(row); item["summary"]=json.loads(item.pop("summary_json")); item["full_audit"]=json.loads(item.pop("full_audit_json")); item["scope_items"]=json.loads(item.pop("scope_items_json")); result.append(item)
     return result
+
+
+def save_client_report_url(history_id: int, report_url: str, db_path: str | Path = DEFAULT_DB, tenant_id: str | None = None) -> None:
+    """Save the public link only in the private, tenant-scoped CRM history."""
+    from urllib.parse import urlparse
+    import re
+
+    parsed = urlparse(str(report_url or ""))
+    if (parsed.scheme != "https" or parsed.hostname not in {
+            "straight-up-digital-site.netlify.app", "straightupdigital.co.za", "www.straightupdigital.co.za"
+        } or not re.fullmatch(r"/report/[A-Za-z0-9_-]{40,60}", parsed.path)):
+        raise ValueError("Refusing to save a non-Straight Up Digital report URL")
+    tenant = tenant_id or env("CRM_TENANT_ID", "straight-up-digital")
+    now = _now()
+    with connect(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE audit_history SET client_report_url=?,client_report_published_at=? WHERE id=? AND tenant_id=?",
+            (report_url, now, int(history_id), tenant),
+        )
+        if cursor.rowcount != 1:
+            raise LookupError("Audit history entry not found in the active tenant")
 
 
 def _now() -> str:

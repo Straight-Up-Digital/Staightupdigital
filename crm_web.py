@@ -568,6 +568,43 @@ def _audit_job_banner(contact_id: int) -> tuple[str, int]:
     return "", 0
 
 
+def _client_report_panel(item: dict) -> str:
+    """Preview the narrowly scoped customer view and require an owner review."""
+    from customer_report import to_customer_report
+
+    try:
+        report = to_customer_report(item.get("full_audit") or {})
+    except (TypeError, ValueError):
+        return '<div class="banner bad">This audit does not yet have a publishable customer report. Check its business website and findings.</div>'
+
+    finding_cards = []
+    for finding in report["findings"]:
+        finding_cards.append(
+            '<article class="scope"><b>' + h(finding["priority"] + ": " + finding["title"]) + '</b>'
+            + '<p><strong>What we found:</strong> ' + h(finding["whatWeFound"]) + '</p>'
+            + '<p><strong>Why it matters:</strong> ' + h(finding["whyItMatters"]) + '</p>'
+            + '<p><strong>What to do next:</strong> ' + h(finding["whatToDo"]) + '</p></article>'
+        )
+    findings_html = "".join(finding_cards) or '<p class="muted">No automated improvement items were produced. Review the full audit manually before publishing.</p>'
+    report_url = str(item.get("client_report_url") or "")
+    published = (
+        '<div class="banner ok"><strong>Online customer report published</strong><p><a class="btn sm" target="_blank" rel="noreferrer" href="'
+        + h(report_url) + '">Open customer report</a></p><p class="muted">Anyone with this private link can view it. It is designed to expire after 30 days. Publishing an updated copy creates a new link; the previous link remains active until its expiry.</p></div>'
+        if report_url else ""
+    )
+    return (
+        '<section class="panel"><h3>Customer-friendly online report</h3>'
+        '<p class="note">Review this version before publishing. It omits internal scores, pricing, sales notes and the full audit. The customer sees the observed issue, why it may matter and a practical fix.</p>'
+        + published
+        + '<details><summary>Preview what the customer will see</summary><h4>' + h(report["businessName"]) + '</h4>'
+        + '<p>' + h(report["summary"]) + '</p>' + findings_html
+        + '<p class="muted">' + h(report["scopeNote"]) + '</p></details>'
+        + '<form method="post" action="/publish-report/' + str(int(item["id"])) + '" class="actions" style="margin-top:12px">'
+        + '<label><input type="checkbox" name="reviewed" value="yes" required> I reviewed the customer wording and checked the findings for accuracy.</label>'
+        + '<button class="btn primary" type="submit">' + ('Publish updated report link' if report_url else 'Publish secure online report') + '</button></form></section>'
+    )
+
+
 def profile_page(contact_id: int, message: str = "") -> tuple[bytes, int]:
     tenant = tenant_id()
     c = get_contact(contact_id, db_path(), tenant)
@@ -620,12 +657,14 @@ def profile_page(contact_id: int, message: str = "") -> tuple[bytes, int]:
                 f'<b>{h(step["step"])}. {h(step["title"])}</b></label><p>Evidence: {h(step["evidence"])}</p><p>Action: {h(step["action"])}</p></form>')
         done = sum(bool(x.get("done")) for x in item.get("scope_items", []))
         total = len(item.get("scope_items", []))
+        client_report_panel = _client_report_panel(item)
         history_html.append(
             f'<div class="history" id="scope-{item["id"]}"><div class="actions"><b>{h(str(item["audit_date"])[:16].replace("T", " "))}</b>'
             f'<span class="pill info">Score {h(item["score"])}/100</span><span class="pill">{h(item["confidence"])} confidence</span>'
             f'<span class="pill accent">Quote {money(item["quote_amount"])}</span>{pdf_link}</div>'
             f'<details open><summary>Scope of Work: {done} of {total} done</summary>{"".join(scope_rows) or "<p class=muted>No action steps were generated.</p>"}</details>'
-            f'<details><summary>Audit results and evidence</summary><pre>{h(json.dumps(item["summary"], indent=2, ensure_ascii=False))}</pre></details></div>')
+            f'<details><summary>Audit results and evidence</summary><pre>{h(json.dumps(item["summary"], indent=2, ensure_ascii=False))}</pre></details>'
+            f'{client_report_panel}</div>')
 
     audit_disabled = "" if is_verified and website_allowed else "disabled"
     audit_note = ("This record is verified and has its own website. It is ready to audit." if not audit_disabled
@@ -995,6 +1034,38 @@ class Handler(BaseHTTPRequestHandler):
         data = {k: v[-1].strip() for k, v in form.items()}
         path = urlparse(self.path).path
         tenant = tenant_id()
+
+        if path.startswith("/publish-report/"):
+            origin = self.headers.get("Origin", "")
+            parsed_origin = urlparse(origin)
+            request_host = (self.headers.get("Host", "") or "").lower()
+            if (not origin or origin == "null" or parsed_origin.scheme != "http"
+                    or parsed_origin.netloc.lower() != request_host
+                    or parsed_origin.hostname not in ("127.0.0.1", "localhost", "::1")):
+                return self.send_body(403, b"Report publishing requires a same-origin local CRM request", "text/plain; charset=utf-8")
+            try:
+                history_id = int(path.rsplit("/", 1)[1])
+                if data.get("reviewed") != "yes":
+                    raise ValueError("Review and confirm the customer version before publishing")
+                with connect(db_path()) as conn:
+                    row = conn.execute(
+                        "SELECT contact_id,full_audit_json FROM audit_history WHERE id=? AND tenant_id=?",
+                        (history_id, tenant),
+                    ).fetchone()
+                if not row:
+                    return self.send_body(404, b"Audit history not found", "text/plain; charset=utf-8")
+                from customer_report import to_customer_report
+                from customer_report_publisher import publish_customer_report
+                client_report = to_customer_report(json.loads(row["full_audit_json"] or "{}"))
+                published = publish_customer_report(client_report)
+                from crm import save_client_report_url
+                save_client_report_url(history_id, published["url"], db_path(), tenant)
+                return _redirect(self, f"/contact/{int(row['contact_id'])}?message=Customer+report+published+and+ready+to+share")
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                return _redirect(self, f"/contact/{history_id if 'history_id' in locals() else 0}?message=" + quote(str(exc)[:180]))
+            except Exception as exc:
+                message = str(exc) if isinstance(exc, RuntimeError) else "Report publishing failed. Check the local token and Netlify configuration."
+                return _redirect(self, f"/contact/{history_id if 'history_id' in locals() else 0}?message=" + quote(message[:180]))
 
         if path.startswith("/scope/"):
             try:
