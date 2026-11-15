@@ -1,14 +1,54 @@
 """Single-worker durable audit queue for one-contact CRM audits."""
 from __future__ import annotations
-import json,queue,threading
+import json,queue,re,threading
 from pathlib import Path
 from config_loader import env
 from security_schema import create_audit_job,update_audit_job,check_cost_limit
-from crm import connect,get_contact,save_audit_result
+from crm import connect,get_contact,save_audit_result,save_contact_fields
 
 _QUEUE=queue.Queue()
 _LOCK=threading.Lock()
 _STARTED=False
+
+_BAD_MAIL=re.compile(r"(\.(png|jpe?g|gif|svg|webp)$|^(noreply|no-reply|donotreply|sentry|wixpress|example)|@(sentry|wixpress|example)\.)",re.I)
+
+def _detected_details(audit:dict,contact:dict)->dict:
+    """Pull email, phone and social links the audit found on the client's own website."""
+    research=audit.get("website_research") or {}
+    signals=research.get("business_signals") or {}
+    out={}
+    host=re.sub(r"^www\.","",(research.get("domain") or "").lower())
+    emails=[e for e in signals.get("emails",[]) if not _BAD_MAIL.search(e)]
+    emails.sort(key=lambda e:(0 if host and e.lower().endswith("@"+host) else 1))
+    if emails and not (contact.get("email") or "").strip():
+        out["email"]=emails[0]
+    phones=signals.get("phone_candidates") or []
+    google_phone=((audit.get("external_research") or {}).get("google_places") or {}).get("phone")
+    if not (contact.get("phone") or "").strip():
+        found=google_phone or (phones[0] if phones else "")
+        if found:out["phone"]=str(found).strip()
+    have=[u for u in (contact.get("social_links") or []) if u]
+    seen={u.lower().rstrip("/") for u in have}
+    new=[]
+    for urls in (research.get("social_profiles") or {}).values():
+        for u in urls:
+            if u.lower().rstrip("/") not in seen:
+                seen.add(u.lower().rstrip("/"));new.append(u)
+    if new:out["social_links"]=have+new
+    return out
+
+def _backfill_contact(contact_id:int,audit:dict,db_path:Path,tenant_id:str):
+    """Fill blank client fields from the audit. Never overwrites anything already saved."""
+    try:
+        current=get_contact(contact_id,db_path,tenant_id)
+        if not current:return
+        found=_detected_details(audit,current)
+        if not found:return
+        data=dict(current);data.update(found)
+        save_contact_fields(contact_id,data,db_path,tenant_id)
+        print(f"Audit job: saved from the website: {', '.join(found)}")
+    except Exception as exc:
+        print(f"Audit job: could not save detected details: {type(exc).__name__}: {exc}")
 
 def _run_one(job_id:str,tenant_id:str,contact_id:int,db_path:Path):
     with connect(db_path) as conn:
@@ -39,6 +79,7 @@ def _run_one(job_id:str,tenant_id:str,contact_id:int,db_path:Path):
         stored=backend.put(f"audits/{tenant_id}/{pdf.name}",pdf.read_bytes())
         audit["pdf_report_path"]=stored
         save_audit_result(contact_id,audit,db_path,tenant_id)
+        _backfill_contact(contact_id,audit,db_path,tenant_id)
         with connect(db_path) as conn:update_audit_job(conn,job_id,"completed",tenant_id=tenant_id)
     except Exception as exc:
         message=f"{type(exc).__name__}: {exc}"
@@ -74,8 +115,10 @@ def enqueue_audit(contact_id:int,tenant_id:str,db_path:Path)->str:
         if not contact.get("details_verified"):raise PermissionError("Verify business details before auditing")
         if contact.get("website_detail")!="own_website_listed" or not contact.get("website_url"):
             raise ValueError("An official business-owned website is required for audit")
-        running=conn.execute("select count(*) from audit_jobs where tenant_id=? and status in ('queued','processing')",(tenant_id,)).fetchone()[0]
-        if running:raise RuntimeError("An audit is already queued or processing for this tenant")
+        running=conn.execute("select count(*) from audit_jobs where tenant_id=? and contact_id=? and status in ('queued','processing')",(tenant_id,int(contact_id))).fetchone()[0]
+        if running:raise RuntimeError("An audit for this business is already queued or processing")
+        pending=conn.execute("select count(*) from audit_jobs where tenant_id=? and status in ('queued','processing')",(tenant_id,)).fetchone()[0]
+        if pending>=50:raise RuntimeError("The tenant audit backlog is full (50 jobs); wait for jobs to finish")
         job_id=create_audit_job(conn,contact_id,tenant_id)
     _QUEUE.put((job_id,tenant_id,int(contact_id),Path(db_path)))
     return job_id

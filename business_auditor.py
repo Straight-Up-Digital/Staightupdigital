@@ -326,15 +326,15 @@ class PublicNetworkBackend(httpcore.SyncBackend):
 
 
 class PublicHTTPTransport(httpx.HTTPTransport):
-    def __init__(self):
-        super().__init__(trust_env=True)
+    def __init__(self, verify: bool = True):
+        super().__init__(verify=verify, trust_env=True)
         # HTTPX 0.28.1 exposes no public network-backend option.
         self._pool._network_backend = PublicNetworkBackend()  # pyright: ignore[reportPrivateUsage]
 
 
-def make_client(timeout: float = 18) -> httpx.Client:
+def make_client(timeout: float = 18, verify: bool = True) -> httpx.Client:
     return httpx.Client(headers={"User-Agent": USER_AGENT}, timeout=timeout, follow_redirects=True,
-                        event_hooks={"request": [guard_request]}, transport=PublicHTTPTransport(),
+                        event_hooks={"request": [guard_request]}, transport=PublicHTTPTransport(verify=verify),
                         trust_env=False)
 
 
@@ -663,7 +663,7 @@ def business_signals(text: str, pages: list[dict]) -> dict:
     }
 
 
-def crawl_website(start_url: str, max_pages: int | None = None) -> dict:
+def _crawl_once(start_url: str, max_pages: int | None = None, insecure: bool = False) -> dict:
     limit = max_pages or MAX_PAGES
     start_url = normalize_input_url(start_url)
     target_domain = urlparse(start_url).netloc
@@ -672,7 +672,7 @@ def crawl_website(start_url: str, max_pages: int | None = None) -> dict:
     robots_blocked = 0
     first_failure = ""
 
-    with make_client(timeout=18) as client:
+    with (make_client(timeout=18, verify=False) if insecure else make_client(timeout=18)) as client:
         parsed_start = urlparse(start_url)
         gate = RobotsGate(client, f"{parsed_start.scheme}://{parsed_start.netloc}")
         while queue and len(pages) < limit:
@@ -727,6 +727,19 @@ def crawl_website(start_url: str, max_pages: int | None = None) -> dict:
         "business_signals": business_signals(combined, pages),
         "crawl_note": "Crawl limited to up to 20 same-domain HTML pages. Blocked pages and JavaScript-rendered content may be missed."
     }
+
+
+def crawl_website(start_url: str, max_pages: int | None = None) -> dict:
+    """Read the site. If its security certificate is not trusted, read it anyway (read only, nothing is sent)
+    and flag the certificate problem, because visitors see a browser warning on such a site."""
+    result = _crawl_once(start_url, max_pages)
+    if not result.get("success") and "CERTIFICATE" in (result.get("first_failure") or "").upper():
+        retry = _crawl_once(start_url, max_pages, insecure=True)
+        if retry.get("success"):
+            retry["ssl_invalid"] = True
+            retry["ssl_error"] = result.get("first_failure", "")
+            return retry
+    return result
 
 
 def public_search(query: str, max_results: int = SEARCH_RESULTS) -> dict:
@@ -3567,6 +3580,15 @@ def run_audit(website: str, business_name: str = "", location: str = "", industr
             "action": ("Check that the business's own domain shows the site directly and is the address search engines "
                        "and customers see. Confirm which address is meant to be the main one before fixing anything else."),
             "service_fit": "Domain and hosting set-up"})
+    if website_research.get("ssl_invalid"):
+        apply_score_penalty(score, "Website structure", 4)
+        opportunities.insert(0, {
+            "priority": "High", "title": "The website's security certificate is not trusted",
+            "evidence": ("Browsers could not verify this site's HTTPS certificate (" + clean_text(website_research.get("ssl_error"))[-110:] +
+                         "). Visitors are likely to see a 'Not secure' or privacy warning before the page loads. "
+                         "Check it in your own browser to confirm, because a problem on one network can look like this."),
+            "action": "Install a valid certificate (usually free through the hosting control panel or Let's Encrypt) and make sure the site redirects to its https address.",
+            "service_fit": "Hosting and security set-up"})
     if builder_site:
         for o in opportunities:
             if o["title"] == "Fix on-page SEO basics" and "builder" not in o["evidence"]:

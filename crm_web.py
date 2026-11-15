@@ -9,6 +9,7 @@ import json
 import os
 import re
 import threading
+import time
 import uuid
 from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -157,116 +158,139 @@ CSS = """
 @font-face{font-family:Montserrat;src:url('/brand-font/montserrat-semibold.ttf') format('truetype');font-weight:600;font-style:normal;font-display:swap}
 @font-face{font-family:Montserrat;src:url('/brand-font/montserrat-bold.ttf') format('truetype');font-weight:700;font-style:normal;font-display:swap}
 :root{
-  --ink:#252B27;--ink-2:#414A43;--muted:#687168;--bg:#F2F4EF;--panel:#fff;--line:#D9DED8;--line-2:#E9ECE7;
-  --signal:#A8FF65;--signal-d:#79B842;--signal-soft:#EEF9E6;
-  --ok:#0e7a5a;--ok-soft:#e2f3ec;--warn:#9a5b00;--warn-soft:#fff2d4;--bad:#b3261e;--bad-soft:#fce8e6;--info:#1d4f91;--info-soft:#e5eefa;
-  --rail:#080A09;
+  color-scheme:dark;
+  --ink:#E8EDE8;--ink-2:#C3CBC4;--muted:#8A968E;--bg:#060807;--panel:#0D1310;--panel-2:#121A15;--line:#1E2923;--line-2:#17201B;
+  --signal:#A8FF65;--signal-d:#79B842;--signal-soft:rgba(168,255,101,.12);
+  --ok:#A8FF65;--ok-soft:rgba(121,184,66,.16);--warn:#F2C14E;--warn-soft:rgba(224,168,0,.15);--bad:#FF8A7A;--bad-soft:rgba(255,107,91,.14);--info:#8FB4FF;--info-soft:rgba(99,150,255,.15);
+  --rail:#040605;--field:#09100C;--field-line:#26332B;
   --display:"Montserrat","Segoe UI",system-ui,sans-serif;
   --body:"Inter","Segoe UI",system-ui,-apple-system,sans-serif;
 }
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
-body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 var(--body);font-variant-numeric:tabular-nums}
-a{color:var(--ink);text-decoration-color:#aeb7ad;text-underline-offset:2px}
-a:hover{text-decoration-color:#6f9f3a}
-h1,h2,h3{font-family:var(--display);margin:0;font-weight:600;letter-spacing:-.01em}
+body{margin:0;background:radial-gradient(900px 480px at 85% -8%,rgba(168,255,101,.07),transparent 62%),radial-gradient(700px 420px at -5% 40%,rgba(80,140,255,.05),transparent 60%),var(--bg);background-attachment:fixed;color:var(--ink);font:14px/1.5 var(--body);font-variant-numeric:tabular-nums}
+a{color:var(--ink);text-decoration-color:#3b4a40;text-underline-offset:2px}
+a:hover{text-decoration-color:var(--signal)}
+h1,h2,h3{font-family:var(--display);margin:0;font-weight:600;letter-spacing:-.01em;color:#F4F7F4}
 h1{font-size:28px;line-height:1.15}
-h2{font-size:17px}
+h2{font-size:16px}
 h3{font-size:14px}
-.app{display:grid;grid-template-columns:232px minmax(0,1fr);min-height:100vh}
-.rail{background:var(--rail);color:#c9cec8;position:sticky;top:0;height:100vh;padding:22px 14px 16px;display:flex;flex-direction:column;gap:26px}
-.logo{width:100%;max-width:190px;height:auto;display:block;padding:0 6px}
+.app{display:grid;grid-template-columns:240px minmax(0,1fr);min-height:100vh}
+.rail{background:linear-gradient(180deg,#070A08,var(--rail));border-right:1px solid var(--line-2);color:#c9cec8;position:sticky;top:0;height:100vh;padding:22px 14px 16px;display:flex;flex-direction:column;gap:26px}
+.logo{width:100%;max-width:200px;height:auto;display:block;padding:0 4px}
 .wordmark{font-family:var(--display);font-weight:700;font-size:19px;color:#fff;padding:0 8px;letter-spacing:-.01em}
-.nav{display:flex;flex-direction:column;gap:2px}
-.nav a{display:flex;align-items:center;gap:11px;padding:9px 10px;border-radius:7px;color:#b4bbb4;text-decoration:none;font-weight:600}
-.nav a:hover{background:#1a1c20;color:#fff}
-.nav a.on{background:rgba(168,255,101,.12);color:#F2F4EF;box-shadow:inset 3px 0 0 var(--signal)}
+.nav{display:flex;flex-direction:column;gap:3px}
+.nav a{display:flex;align-items:center;gap:11px;padding:10px 12px;border-radius:9px;color:#9fa9a2;text-decoration:none;font-weight:600}
+.nav a:hover{background:#101712;color:#fff}
+.nav a.on{background:linear-gradient(90deg,rgba(168,255,101,.16),rgba(168,255,101,.04));color:#F2F4EF;box-shadow:inset 3px 0 0 var(--signal)}
+.nav a.on .ic{color:var(--signal)}
 .ic{width:18px;height:18px;flex:none}
-.rail-foot{margin-top:auto;font-size:12px;color:#7b818c;padding:0 8px;line-height:1.5}
-.rail-foot b{color:var(--signal);font-weight:700;letter-spacing:.05em}
-.main{padding:28px 34px 70px;max-width:1560px;width:100%;min-width:0}
+.rail-foot{margin-top:auto;font-size:11.5px;color:#6d7971;padding:12px;line-height:1.55;border:1px solid var(--line-2);border-radius:12px;background:rgba(255,255,255,.015)}
+.rail-foot b{color:var(--signal);font-weight:700;letter-spacing:.08em}
+.main{padding:28px 34px 70px;max-width:1600px;width:100%;min-width:0}
 .head{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;margin-bottom:22px;flex-wrap:wrap}
-.head p{margin:4px 0 0;color:var(--muted);max-width:62ch}
+.head p{margin:5px 0 0;color:var(--muted);max-width:66ch}
 .actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.flash{padding:11px 14px;border-radius:8px;margin-bottom:18px;font-weight:600;background:var(--ok-soft);color:#0b5c44;border:1px solid #bfe1d3}
-.flash.warn{background:var(--warn-soft);color:#7a4700;border-color:#efd493}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px 20px;margin-bottom:18px}
+.flash{padding:11px 14px;border-radius:10px;margin-bottom:18px;font-weight:600;background:var(--ok-soft);color:var(--ok);border:1px solid rgba(121,184,66,.35)}
+.flash.warn{background:var(--warn-soft);color:var(--warn);border-color:rgba(224,168,0,.4)}
+.panel{background:linear-gradient(180deg,var(--panel-2),var(--panel));border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin-bottom:18px;box-shadow:inset 0 1px 0 rgba(255,255,255,.035),0 12px 30px rgba(0,0,0,.28)}
 .panel>h2,.panel-head h2{margin-bottom:12px}
 .panel-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:12px}
 .panel-head h2{margin:0}
 .panel-head span{color:var(--muted);font-size:13px}
-.note{color:var(--muted);font-size:13px;margin:0 0 12px;max-width:70ch}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:9px 15px;border-radius:7px;border:1px solid #cdd1d8;background:#fff;color:var(--ink);font:inherit;font-weight:650;cursor:pointer;text-decoration:none;line-height:1.2}
-.btn:hover{background:#f6f7f9;border-color:#b9bec7}
-.btn.primary{background:var(--signal);border-color:var(--signal);color:var(--ink)}
-.btn.primary:hover{background:#96ED55;border-color:#96ED55}
-.btn.dark{background:var(--ink);border-color:var(--ink);color:#fff}
-.btn.dark:hover{background:#262a30}
+.note{color:var(--muted);font-size:13px;margin:0 0 12px;max-width:72ch}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:9px 15px;border-radius:9px;border:1px solid var(--field-line);background:#111915;color:var(--ink);font:inherit;font-weight:650;cursor:pointer;text-decoration:none;line-height:1.2;transition:background .15s,border-color .15s,transform .05s}
+.btn:hover{background:#18221C;border-color:#3A4A40}
+.btn:active{transform:translateY(1px)}
+.btn.primary{background:var(--signal);border-color:var(--signal);color:#07100A;box-shadow:0 0 0 0 rgba(168,255,101,.0),0 6px 18px rgba(168,255,101,.18)}
+.btn.primary:hover{background:#BDFF8A;border-color:#BDFF8A}
+.btn.dark{background:#1B2620;border-color:#34443A;color:#fff}
+.btn.dark:hover{background:#243229}
 .btn.sm{padding:5px 10px;font-size:13px}
 .btn.block{width:100%}
-.btn:disabled{opacity:.45;cursor:not-allowed}
-:focus-visible{outline:2px solid var(--ink);outline-offset:2px;box-shadow:0 0 0 3px var(--signal)}
-input,select,textarea{font:inherit;padding:8px 10px;border:1px solid #cdd1d8;border-radius:6px;background:#fff;color:var(--ink);max-width:100%}
-input:focus,select:focus,textarea:focus{outline:2px solid rgba(37,43,39,.18);border-color:#79B842}
-input[readonly]{background:#f3f4f6;color:var(--ink-2)}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+:focus-visible{outline:2px solid var(--signal);outline-offset:2px}
+input,select,textarea{font:inherit;padding:9px 11px;border:1px solid var(--field-line);border-radius:9px;background:var(--field);color:var(--ink);max-width:100%}
+input::placeholder,textarea::placeholder{color:#5f6c64}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--signal-d);box-shadow:0 0 0 3px rgba(168,255,101,.14)}
+input[readonly]{background:#0C120F;color:var(--muted)}
+input[type=checkbox]{accent-color:var(--signal)}
+option{background:#0D1310;color:var(--ink)}
 textarea{width:100%;min-height:84px;resize:vertical}
-.pill{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;font-weight:650;background:#eceef1;color:#454b55;white-space:nowrap;line-height:1.7}
+.pill{display:inline-block;padding:1px 10px;border-radius:999px;font-size:12px;font-weight:650;background:rgba(255,255,255,.07);color:#C3CBC4;white-space:nowrap;line-height:1.7}
 .pill.ok{background:var(--ok-soft);color:var(--ok)}
 .pill.warn{background:var(--warn-soft);color:var(--warn)}
 .pill.bad{background:var(--bad-soft);color:var(--bad)}
 .pill.info{background:var(--info-soft);color:var(--info)}
-.pill.accent{background:var(--signal-soft);color:#35551F}
-.pill.dark{background:var(--ink);color:#fff}
+.pill.accent{background:var(--signal-soft);color:var(--signal)}
+.pill.dark{background:#F2F4EF;color:#080A09}
 .muted{color:var(--muted);overflow-wrap:anywhere}
 .small{font-size:12.5px}
-.avatar{width:36px;height:36px;border-radius:8px;display:grid;place-items:center;font:700 13px var(--display);flex:none;background:#e7e9ee;color:#394150}
-.avatar.t1{background:#e5eefa;color:#1d4f91}.avatar.t2{background:#e2f3ec;color:#0e7a5a}.avatar.t3{background:#fff2d4;color:#8a5200}.avatar.t4{background:#fce8e6;color:#a3241c}
-.avatar.big{width:56px;height:56px;border-radius:12px;font-size:19px}
+.avatar{width:36px;height:36px;border-radius:10px;display:grid;place-items:center;font:700 13px var(--display);flex:none;background:#18211B;color:#B4BEB6;border:1px solid var(--line)}
+.avatar.t1{background:rgba(99,150,255,.14);color:#8FB4FF;border-color:rgba(99,150,255,.25)}.avatar.t2{background:rgba(121,184,66,.14);color:#A8FF65;border-color:rgba(121,184,66,.28)}.avatar.t3{background:rgba(224,168,0,.14);color:#F2C14E;border-color:rgba(224,168,0,.28)}.avatar.t4{background:rgba(255,107,91,.13);color:#FF8A7A;border-color:rgba(255,107,91,.26)}
+.avatar.big{width:58px;height:58px;border-radius:14px;font-size:19px}
 
-.hero{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(290px,1fr);gap:18px;margin-bottom:18px;align-items:start}
+/* score dial and KPI tiles */
+.dial{--p:0;--c:var(--signal-d);--s:84px;position:relative;width:var(--s);height:var(--s);border-radius:50%;flex:none;display:grid;place-items:center;background:conic-gradient(var(--c) calc(var(--p)*1%),#1B2520 0)}
+.dial::before{content:"";position:absolute;inset:calc(var(--s)*.11);border-radius:50%;background:var(--panel)}
+.dial b{position:relative;display:block;font:700 calc(var(--s)*.31)/1 var(--display);color:#fff;text-align:center}
+.dial b small{display:block;margin-top:2px;font:500 calc(var(--s)*.12)/1 var(--body);color:var(--muted)}
+.dial.sm{--s:46px}.dial.sm b{font-size:15px}.dial.sm b small{display:none}
+.dial.good{--c:#A8FF65}.dial.mid{--c:#F2C14E}.dial.low{--c:#FF7A6A}.dial.none{--c:#3A463E}
+.kpis{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:14px;margin-bottom:18px}
+.kpi{position:relative;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 18px;border-radius:14px;border:1px solid var(--line);background:linear-gradient(180deg,var(--panel-2),var(--panel));box-shadow:inset 0 1px 0 rgba(255,255,255,.035),0 10px 26px rgba(0,0,0,.25);text-decoration:none;color:var(--ink);min-width:0}
+.kpi:hover{border-color:#34443A}
+.kpi::after{content:"";position:absolute;left:18px;right:18px;top:0;height:2px;border-radius:0 0 2px 2px;background:var(--signal);opacity:.75}
+.kpi.blue::after{background:#6d98d6}.kpi.amber::after{background:#e8a91d}.kpi.mint::after{background:#13a07a}
+.kpi .lab{font-size:11.5px;font-weight:650;letter-spacing:.07em;text-transform:uppercase;color:var(--muted)}
+.kpi .num{font:700 32px/1.1 var(--display);color:#fff;margin-top:6px;letter-spacing:-.02em}
+.kpi .sub{font-size:12.5px;color:var(--muted);margin-top:3px}
+.kpi .dial{--s:64px}
+
+.hero{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(300px,1fr);gap:18px;margin-bottom:18px;align-items:start}
 .hero .panel{margin:0}
-.today-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 14px;align-items:center;padding:10px 0;border-top:1px solid var(--line-2)}
+.today-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 14px;align-items:center;padding:11px 0;border-top:1px solid var(--line-2)}
 .today-row:first-of-type{border-top:0}
 .today-row b a{text-decoration:none}
 .empty{padding:14px 0;color:var(--muted)}
-.mrr{background:var(--ink);color:#fff;border-color:var(--ink)}
+.mrr{background:radial-gradient(420px 200px at 100% 0%,rgba(168,255,101,.18),transparent 60%),linear-gradient(180deg,#101A13,#0A100C);border-color:#2A3A2F}
 .mrr .big{font:700 44px/1 var(--display);letter-spacing:-.02em;color:var(--signal)}
-.mrr .big small{font-size:16px;font-weight:500;color:#9aa0ab;margin-left:6px}
-.mrr p{color:#9aa0ab;margin:8px 0 0}
+.mrr .big small{font-size:16px;font-weight:500;color:var(--muted);margin-left:6px}
+.mrr p{color:var(--muted);margin:8px 0 0}
 .finder-links{display:flex;flex-direction:column;gap:10px;margin-top:6px}
 .finder-links form{display:flex;gap:8px;flex-wrap:wrap}
 .finder-links input{flex:1;min-width:120px}
 
 .funnel{display:flex;height:10px;border-radius:6px;overflow:hidden;background:var(--line-2);margin:2px 0 14px}
 .funnel .seg{display:block;height:100%}
-.seg-new{background:#b8bec9}.seg-contacted{background:#6d98d6}.seg-quoted{background:#e8a91d}.seg-accepted{background:var(--signal)}.seg-live{background:#13a07a}.seg-lost{background:#d79a96}
+.seg-new{background:#66726B}.seg-contacted{background:#6d98d6}.seg-quoted{background:#e8a91d}.seg-accepted{background:var(--signal)}.seg-live{background:#13a07a}.seg-lost{background:#c0605a}
 .stages{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px}
-.stage{display:block;text-decoration:none;padding:8px 10px;border-radius:7px;border:1px solid transparent}
-.stage:hover{background:#f5f6f8;border-color:var(--line)}
-.stage b{display:block;font:700 26px/1.1 var(--display);letter-spacing:-.01em}
+.stage{display:block;text-decoration:none;padding:10px 12px;border-radius:10px;border:1px solid var(--line-2);background:rgba(255,255,255,.015)}
+.stage:hover{background:rgba(255,255,255,.04);border-color:#34443A}
+.stage b{display:block;font:700 26px/1.1 var(--display);letter-spacing:-.01em;color:#fff}
 .stage span{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:13px}
 .stage span i{width:8px;height:8px;border-radius:50%;display:inline-block}
 
 .chips{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 12px}
-.chip{display:inline-flex;gap:7px;align-items:center;padding:5px 11px;border:1px solid var(--line);background:#fff;border-radius:999px;text-decoration:none;font-weight:600;font-size:13px;color:var(--ink-2)}
-.chip b{font-weight:700;color:var(--ink)}
-.chip:hover{border-color:#b9bec7}
-.chip.on{background:var(--ink);border-color:var(--ink);color:var(--signal)}
-.chip.on b{color:#fff}
+.chip{display:inline-flex;gap:7px;align-items:center;padding:5px 12px;border:1px solid var(--line);background:#0E1511;border-radius:999px;text-decoration:none;font-weight:600;font-size:13px;color:var(--ink-2)}
+.chip b{font-weight:700;color:#fff}
+.chip:hover{border-color:#3A4A40}
+.chip.on{background:var(--signal);border-color:var(--signal);color:#07100A}
+.chip.on b{color:#07100A}
 .filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
 .filters input[type=search]{flex:1;min-width:220px}
 
-.tbl-wrap{overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:10px;max-height:72vh}
+.tbl-wrap{overflow:auto;background:linear-gradient(180deg,var(--panel-2),var(--panel));border:1px solid var(--line);border-radius:14px;max-height:72vh;box-shadow:0 12px 30px rgba(0,0,0,.28)}
 table{border-collapse:collapse;width:100%;min-width:980px}
-th{position:sticky;top:0;z-index:1;background:#f7f8fa;text-align:left;font-size:12.5px;font-weight:650;color:var(--muted);padding:10px 14px;border-bottom:1px solid var(--line);white-space:nowrap}
-td{padding:11px 14px;border-bottom:1px solid var(--line-2);vertical-align:middle}
-tbody tr:hover{background:#fafbfc}
+th{position:sticky;top:0;z-index:1;background:#0A100C;text-align:left;font-size:11.5px;font-weight:650;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);padding:12px 14px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:12px 14px;border-bottom:1px solid var(--line-2);vertical-align:middle}
+tbody tr:hover{background:rgba(168,255,101,.035)}
 tbody tr:last-child td{border-bottom:0}
 .biz{display:flex;gap:11px;align-items:center;min-width:220px}
-.biz a{font-weight:650;text-decoration:none}
+.biz a{font-weight:650;text-decoration:none;color:#fff}
 .biz a:hover{text-decoration:underline;text-decoration-color:var(--signal)}
 .due{color:var(--bad);font-weight:650}
-.stars{color:#b7791f}
+.stars{color:#F2C14E}
 
 .profile{display:grid;grid-template-columns:minmax(0,1fr) 390px;gap:20px;align-items:start}
 .profile>*{min-width:0}
@@ -274,6 +298,10 @@ tbody tr:last-child td{border-bottom:0}
 .phead{display:flex;gap:16px;align-items:center;margin-bottom:20px;flex-wrap:wrap}
 .phead .who{flex:1;min-width:240px}
 .phead .tags{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.phead .score{display:flex;align-items:center;gap:14px;padding:12px 16px;border:1px solid var(--line);border-radius:14px;background:linear-gradient(180deg,var(--panel-2),var(--panel))}
+.phead .score .dial{--s:78px}
+.phead .score .lab{font-size:11.5px;font-weight:650;letter-spacing:.07em;text-transform:uppercase;color:var(--muted)}
+.phead .score .q{font:700 20px/1.2 var(--display);color:var(--signal);margin-top:3px}
 .crumb{color:var(--muted);margin-bottom:12px;font-size:13px}
 .crumb a{color:var(--muted)}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:13px 14px}
@@ -283,39 +311,44 @@ tbody tr:last-child td{border-bottom:0}
 .panel input[type=checkbox]{width:auto;padding:0;flex:none}
 .nw{white-space:nowrap}
 .row-actions{display:flex;gap:6px;flex-wrap:nowrap}
-.checks{display:flex;flex-direction:column;gap:8px;grid-column:1/-1;padding:12px 14px;background:#f7f8fa;border-radius:8px;border:1px solid var(--line-2)}
+.checks{display:flex;flex-direction:column;gap:8px;grid-column:1/-1;padding:12px 14px;background:rgba(255,255,255,.025);border-radius:10px;border:1px solid var(--line-2)}
 .checks label{display:flex;gap:9px;align-items:flex-start;font-weight:500}
 .checks input{margin-top:3px}
-.savebar{position:sticky;bottom:0;background:rgba(239,241,243,.94);backdrop-filter:blur(6px);padding:12px 0;margin-top:4px;display:flex;justify-content:flex-end;gap:10px;border-top:1px solid var(--line)}
-.stack{display:flex;flex-direction:column;gap:10px}
+.savebar{position:sticky;bottom:0;background:rgba(6,8,7,.9);backdrop-filter:blur(8px);padding:12px 0;margin-top:4px;display:flex;justify-content:flex-end;gap:10px;border-top:1px solid var(--line)}
+.stack{display:flex;flex-direction:column;gap:18px}
+.stack>.panel{margin:0}
 .rule{border:0;border-top:1px solid var(--line-2);margin:14px 0}
 .rank-form{display:grid;grid-template-columns:minmax(0,1fr);gap:8px}
 .rank-form>*{min-width:0;width:100%}
 .rank-table{width:100%;min-width:0;font-size:13px}
-.rank-table th{position:static;padding:6px 8px;background:transparent;font-size:12px}
+.rank-table th{position:static;padding:6px 8px;background:transparent;font-size:11px}
 .rank-table td{padding:7px 8px}
-.banner{padding:10px 14px;border-radius:8px;margin-bottom:16px;font-weight:600;background:var(--info-soft);color:var(--info);border:1px solid #c6d9f2}
-.banner.bad{background:var(--bad-soft);color:var(--bad);border-color:#f2c5c1}
+.banner{padding:11px 14px;border-radius:10px;margin-bottom:16px;font-weight:600;background:var(--info-soft);color:var(--info);border:1px solid rgba(99,150,255,.32)}
+.banner.bad{background:var(--bad-soft);color:var(--bad);border-color:rgba(255,107,91,.35)}
+.banner.ok{background:var(--ok-soft);color:var(--ok);border-color:rgba(121,184,66,.35)}
 .history{border-top:1px solid var(--line-2);padding:14px 0}
 .history:first-of-type{border-top:0}
 .history summary{cursor:pointer;font-weight:650;margin-top:10px}
 .history .scope{padding:9px 10px;border-top:1px solid var(--line-2)}
 .history .scope p{margin:3px 0 3px 26px;color:var(--ink-2)}
-pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f7f8fa;padding:12px;border-radius:7px;font-size:12px}
+details>summary{color:var(--ink)}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#08100B;border:1px solid var(--line-2);color:var(--ink-2);padding:12px;border-radius:9px;font-size:12px}
 .src-links a{display:block;overflow-wrap:anywhere;margin:5px 0}
 .job{display:flex;gap:10px;align-items:flex-start}
-.dot{width:10px;height:10px;border-radius:50%;background:#79B842;margin-top:6px;flex:none;animation:pulse 1.2s ease-in-out infinite}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--signal);margin-top:6px;flex:none;animation:pulse 1.2s ease-in-out infinite}
 @keyframes pulse{50%{opacity:.25}}
 @media (prefers-reduced-motion:reduce){.dot{animation:none}}
-.log{font:12px/1.5 Consolas,ui-monospace,monospace;color:var(--ink-2);margin:8px 0 0;background:#f7f8fa;border-radius:7px;padding:10px 12px;max-height:150px;overflow:auto}
+.log{font:12px/1.5 Consolas,ui-monospace,monospace;color:var(--ink-2);margin:8px 0 0;background:#08100B;border:1px solid var(--line-2);border-radius:9px;padding:10px 12px;max-height:150px;overflow:auto}
 .srcs{display:flex;gap:5px;flex-wrap:wrap}
 
+@media (max-width:1300px){.kpis{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media (max-width:1100px){.profile{grid-template-columns:minmax(0,1fr)}.aside{position:static}.hero{grid-template-columns:1fr}}
 @media (max-width:860px){
   .app{grid-template-columns:minmax(0,1fr)}
-  .rail{position:static;height:auto;flex-direction:row;align-items:center;flex-wrap:wrap;padding:12px 14px;gap:12px}
+  .rail{position:static;height:auto;flex-direction:row;align-items:center;flex-wrap:wrap;padding:12px 14px;gap:12px;border-right:0;border-bottom:1px solid var(--line-2)}
   .logo{max-width:130px}.nav{flex-direction:row;flex-wrap:nowrap;overflow-x:auto;max-width:100%}.nav a{white-space:nowrap}.rail-foot{display:none}
   .main{padding:20px 16px 60px}
+  .kpis{grid-template-columns:repeat(2,minmax(0,1fr))}
   .stages{grid-template-columns:repeat(3,minmax(0,1fr))}
 }
 """
@@ -327,13 +360,29 @@ document.addEventListener('change',function(e){
     var f=t.closest('form');
     f.querySelectorAll('input[name="pick"]').forEach(function(c){c.checked=t.checked;});
   }
+  if(t&&t.matches&&t.matches('[data-csv-file]')){
+    var file=t.files&&t.files[0];
+    if(!file)return;
+    if(file.size>250000){window.alert('This CRM accepts CSV files up to 250 KB.');t.value='';return;}
+    var reader=new FileReader();
+    reader.onload=function(){var box=document.getElementById('csv-text');if(box)box.value=String(reader.result||'');};
+    reader.onerror=function(){window.alert('The selected CSV could not be read.');};
+    reader.readAsText(file);
+  }
 });
 """
 
 ICONS = {
     "leads": '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.9"/><path d="M16 3.1a4 4 0 0 1 0 7.8"/>',
     "notlisted": '<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/><path d="M8 11h6"/>',
+    "audited": '<path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><path d="m9 14 2 2 4-4"/>',
     "shield": '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/>',
+    "privacy": '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/>',
+    "bulk": '<path d="M4 6h16M4 12h16M4 18h16"/><path d="m7 4-3 2 3 2M17 10l3 2-3 2M7 16l-3 2 3 2"/>',
+    "finance": '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18M7 15h4"/>',
+    "queue": '<path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/>',
+    "projects": '<path d="M3 7h7l2 2h9v10H3z"/><path d="M3 7V5h7l2 2"/>',
+    "insights": '<path d="M3 3v18h18"/><path d="m7 14 4-4 4 3 5-7"/>',
 }
 
 
@@ -348,7 +397,7 @@ def layout(title: str, body: str, active: str = "leads", message: str = "", refr
         brand = '<img class="logo" src="/brand-logo" alt="Straight Up Digital">'
     else:
         brand = f'<div class="wordmark">{h(cfg.get("agency_name", "Straight Up Digital"))}</div>'
-    nav_items = [("leads", "/", "Leads"), ("notlisted", "/not-listed", "Not listed"), ("shield", "/suppression", "Do not contact")]
+    nav_items = [("leads", "/", "Leads"), ("audited", "/audited", "Audited"), ("queue", "/queue", "Audit queue"), ("finance", "/finance", "Sales & billing"), ("projects", "/projects", "Projects"), ("insights", "/insights", "Insights"), ("bulk", "/bulk", "Bulk actions"), ("privacy", "/privacy", "Privacy"), ("shield", "/suppression", "Do not contact"), ("notlisted", "/not-listed", "Not listed")]
     nav = "".join(f'<a href="{href}" class="{"on" if key == active or (key == "shield" and active == "suppression") else ""}">{icon(key)}{label}</a>'
                   for key, href, label in nav_items)
     flash = ""
@@ -369,6 +418,16 @@ def avatar(name: str, big: bool = False) -> str:
     initials = "".join(w[0] for w in words[:2]).upper() or "?"
     tint = int(hashlib.md5((name or "").encode("utf-8")).hexdigest(), 16) % 5
     return f'<span class="avatar t{tint}{" big" if big else ""}" aria-hidden="true">{h(initials)}</span>'
+
+
+def dial(score, small: str = "/100", tone: str = "", sm: bool = False) -> str:
+    """Round score gauge drawn in CSS. No score shows a grey ring."""
+    try:
+        value = max(0, min(100, int(round(float(score)))))
+    except (TypeError, ValueError):
+        return f'<span class="dial none{" sm" if sm else ""}" style="--p:0" aria-label="No score"><b>n/a</b></span>'
+    tone = tone or ("good" if value >= 75 else "mid" if value >= 50 else "low")
+    return f'<span class="dial {tone}{" sm" if sm else ""}" style="--p:{value}" role="img" aria-label="Score {value} out of 100"><b>{value}<small>{h(small)}</small></b></span>'
 
 
 def stage_pill(stage: str) -> str:
@@ -485,11 +544,26 @@ def main_page(params: dict[str, str], message: str = "") -> bytes:
     edit_prices = "".join(f'<li>{h(k.replace("_", " ").capitalize())}: {money(v)}</li>' for k, v in p["edits"].items())
     retainer_list = "".join(f'<li>{h(x.get("name"))}: {money(x.get("price_zar_month"))} a month</li>' for x in p["retainers"])
 
+    today_iso = date.today().isoformat()
+    due_n = sum(1 for c in all_contacts if c.get("next_follow_up_date") and c["next_follow_up_date"] <= today_iso
+                and c.get("pipeline_stage") not in ("live", "lost"))
+    verified_n = sum(1 for c in all_contacts if c.get("details_verified"))
+    verified_pct = round(verified_n / len(all_contacts) * 100) if all_contacts else 0
+    build_n, audit_n = counts["no_website_listed"], counts["own_website_listed"]
+    kpis = (
+        f'<div class="kpis">'
+        f'<a class="kpi" href="/"><div><div class="lab">Total leads</div><div class="num">{len(all_contacts)}</div><div class="sub">{live} live client{"s" if live != 1 else ""}</div></div></a>'
+        f'<a class="kpi blue" href="/?website_detail=no_website_listed"><div><div class="lab">Build leads</div><div class="num">{build_n}</div><div class="sub">No website listed &middot; {money(build_n * p["build"])} potential</div></div></a>'
+        f'<a class="kpi amber" href="/?website_detail=own_website_listed"><div><div class="lab">Audit leads</div><div class="num">{audit_n}</div><div class="sub">Own website listed</div></div></a>'
+        f'<div class="kpi mint"><div><div class="lab">Checked by you</div><div class="num">{verified_n}</div><div class="sub">of {len(all_contacts)} verified</div></div>{dial(verified_pct, "%", "good")}</div>'
+        f'<div class="kpi"><div><div class="lab">Follow up</div><div class="num">{due_n}</div><div class="sub">due or overdue</div></div></div>'
+        f'</div>')
     body = f'''
 <div class="head"><div><h1>Leads</h1><p>Check public listings before you contact anyone. A search that finds no website does not prove the business has none.</p></div>
 <div class="actions"><a class="btn" href="/export.csv?{csv_params}">Export CSV</a></div></div>
+{kpis}
 <div class="hero">{_today_panel(all_contacts)}
-<div class="stack"><section class="panel mrr"><h3 style="color:#9aa0ab;font-weight:500">Monthly recurring income</h3>
+<div class="stack"><section class="panel mrr"><h3 style="color:var(--muted);font-weight:500">Monthly recurring income</h3>
 <div class="big">{money(mrr)}<small>a month</small></div><p>From {live} live client{"s" if live != 1 else ""}, including hosting.</p></section>
 <section class="panel"><h2>Find more leads</h2><div class="finder-links">
 <form method="get" action="/sweep/plan"><input name="town" required placeholder="Town, for example Kenton-on-Sea" aria-label="Town"><input name="max_searches" type="number" min="1" max="50" value="12" style="width:72px" aria-label="Most searches"><button class="btn dark">Plan Google Maps search</button></form>
@@ -605,6 +679,85 @@ def _client_report_panel(item: dict) -> str:
     )
 
 
+def _activity_panel(contact: dict, histories: list[dict]) -> str:
+    from crm_ops import list_activities, personalised_templates, top_audit_finding
+    try:
+        events = list_activities(contact["id"], db_path(), tenant_id())
+        finding = top_audit_finding(contact["id"], db_path(), tenant_id())
+    except Exception:
+        events, finding = [], ""
+    templates = personalised_templates(contact, finding)
+    phone = re.sub(r"\D", "", str(contact.get("phone") or ""))
+    if phone.startswith("0"):
+        phone = "27" + phone[1:]
+    wa = f'https://wa.me/{phone}?text={quote(templates["whatsapp_audit"])}' if phone else ""
+    mail = "mailto:" + quote(str(contact.get("email") or "")) + "?subject=" + quote(templates["email_audit_subject"]) + "&body=" + quote(templates["email_audit_body"]) if contact.get("email") else ""
+    drafts = ('<a class="btn sm primary" target="_blank" rel="noreferrer" href="' + h(wa) + '">Open WhatsApp draft</a>' if wa else '<span class="pill warn">Add a phone number for WhatsApp</span>')
+    drafts += (' <a class="btn sm" href="' + h(mail) + '">Open email draft</a>' if mail else '')
+    rows = []
+    for event in events:
+        outcome = f'<p class="muted"><b>Outcome:</b> {h(event["outcome"])}</p>' if event["outcome"] else ""
+        rows.append('<div class="history"><div class="actions"><span class="pill accent">' + h(event["event_type"].title()) + '</span><span class="pill">' + h(event["channel"] or "Channel not set") + '</span><span class="pill">' + h(event["direction"].title()) + '</span><span class="muted small">' + h(event["created_at"][:16].replace("T", " ")) + '</span></div><p>' + h(event["summary"]) + '</p>' + outcome + '</div>')
+    timeline = "".join(rows) or '<p class="muted">No calls or messages logged yet. Record each conversation here.</p>'
+    type_opts = _select("event_type", ["call", "whatsapp", "email", "meeting", "note", "other"], "call", {"call":"Call", "whatsapp":"WhatsApp", "email":"Email", "meeting":"In person / meeting", "note":"Note", "other":"Other"})
+    return f'''<section class="panel"><div class="panel-head"><h2>Contact timeline</h2><span>{len(events)} logged</span></div>
+<p class="note">Use a ready-made draft as a starting point, then review and send it yourself. The audit finding is pulled from the latest saved audit.</p><div class="actions">{drafts}</div>
+<details style="margin-top:12px"><summary>Message templates</summary><p class="small"><b>WhatsApp audit opener:</b> {h(templates["whatsapp_audit"])}</p><p class="small"><b>Follow-up:</b> {h(templates["whatsapp_followup"])}</p><p class="small"><b>Email subject:</b> {h(templates["email_audit_subject"])}</p></details>
+<form method="post" action="/activity/add" class="grid" style="margin-top:14px"><input type="hidden" name="contact_id" value="{contact["id"]}">
+<div class="field">{type_opts}</div><div class="field"><label class="lab">Direction</label><select name="direction"><option value="outbound">I contacted them</option><option value="inbound">They contacted me</option><option value="internal">Internal note</option></select></div><div class="field"><label class="lab">Channel</label><input name="channel" placeholder="Phone, WhatsApp, email, in person"></div>
+<div class="field wide"><label class="lab">What happened?</label><textarea name="summary" required maxlength="4000" placeholder="What you said, sent, or discussed"></textarea></div>
+<div class="field wide"><label class="lab">Reply / outcome / next step</label><textarea name="outcome" maxlength="2000" placeholder="What they replied and agreed to do"></textarea></div>
+<div class="actions wide"><button class="btn primary" type="submit">Add to timeline</button></div></form><hr class="rule">{timeline}</section>'''
+
+
+def _finance_panel(contact: dict) -> str:
+    from crm import connect
+    tenant = tenant_id()
+    with connect(db_path()) as conn:
+        quotes = [dict(r) for r in conn.execute("SELECT * FROM crm_quotes WHERE contact_id=? AND tenant_id=? ORDER BY created_at DESC", (contact["id"], tenant))]
+        invoices = [dict(r) for r in conn.execute("SELECT i.*,COALESCE(SUM(p.amount),0) paid FROM crm_invoices i LEFT JOIN crm_payments p ON p.invoice_id=i.id AND p.tenant_id=i.tenant_id WHERE i.contact_id=? AND i.tenant_id=? GROUP BY i.id ORDER BY i.issued_on DESC", (contact["id"], tenant))]
+        recurring = [dict(r) for r in conn.execute("SELECT * FROM crm_recurring_items WHERE contact_id=? AND tenant_id=? AND active=1 ORDER BY next_due_on", (contact["id"], tenant))]
+    quote_rows = []
+    for q in quotes:
+        status = _select("status", ["draft", "sent", "accepted", "declined", "expired"], q["status"])
+        quote_rows.append(f'<tr><td>{h(q["quote_number"])}</td><td>{h(q["description"])}</td><td>{money(q["amount"])}</td><td><form method=post action="/quote/status"><input type=hidden name=quote_id value="{q["id"]}">{status}<button class="btn sm">Save</button></form></td></tr>')
+    invoice_rows = []
+    for inv in invoices:
+        balance = max(0, float(inv["amount"]) - float(inv["paid"]))
+        invoice_rows.append(f'<tr><td>{h(inv["invoice_number"])}</td><td>{h(inv["description"])}</td><td>{money(inv["amount"])}</td><td>{money(balance)} <span class="pill {"ok" if balance == 0 else "warn"}">{h(inv["status"])}</span></td><td><a class="btn sm" href="/invoice/{inv["id"]}/pdf">Branded PDF</a></td></tr>')
+    inv_opts = '<option value="">No invoice (general payment)</option>' + ''.join(f'<option value="{r["id"]}">{h(r["invoice_number"])} — {money(max(0,float(r["amount"])-float(r["paid"])))}</option>' for r in invoices if r["status"] != "paid")
+    rec_rows=[]
+    for item in recurring:
+        current_month = date.today().strftime("%Y-%m")
+        paid = str(item.get("last_paid_on") or "").startswith(current_month)
+        rec_rows.append(f'<tr><td>{h(item["description"] or item["item_type"].replace("_"," ").title())}</td><td>{money(item["amount"])} / {h(item["frequency"])}</td><td>{h(item["next_due_on"] or "Not set")}</td><td><span class="pill {"ok" if paid else "warn"}">{"Paid this month" if paid else "Not marked paid"}</span></td><td><form method=post action="/recurring/paid"><input type=hidden name=item_id value="{item["id"]}"><button class="btn sm" type=submit>Mark paid today</button></form></td></tr>')
+    quote_table = '<div class="tbl-wrap"><table style="min-width:680px"><thead><tr><th>Quote</th><th>Scope</th><th>Amount</th><th>Status</th></tr></thead><tbody>' + (''.join(quote_rows) or '<tr><td colspan=4>No quotes recorded.</td></tr>') + '</tbody></table></div>'
+    invoice_table = '<div class="tbl-wrap"><table style="min-width:720px"><thead><tr><th>Invoice</th><th>Scope</th><th>Total</th><th>Balance</th><th></th></tr></thead><tbody>' + (''.join(invoice_rows) or '<tr><td colspan=5>No invoices yet.</td></tr>') + '</tbody></table></div>'
+    recurring_table = '<div class="tbl-wrap"><table style="min-width:760px"><thead><tr><th>Service</th><th>Charge</th><th>Next due</th><th>This month</th><th></th></tr></thead><tbody>' + (''.join(rec_rows) or '<tr><td colspan=5>No recurring charges or renewals tracked.</td></tr>') + '</tbody></table></div>'
+    return f'''<section class="panel"><h2>Quotes, invoices & payments</h2><p class="note">Manual record-keeping only. No money is collected, and no payment is initiated by this CRM.</p><h3>Quotes</h3>{quote_table}
+<form method="post" action="/quote/create" class="filters" style="margin-top:10px"><input type=hidden name=contact_id value="{contact["id"]}"><input name=description required placeholder="Quote description"><input name=amount type=number min="0" step="0.01" required placeholder="Amount (R)"><input name=due_at type=date aria-label="Quote expiry"><button class="btn">Create quote</button></form>
+<h3 style="margin-top:16px">Invoices and recorded payments</h3>{invoice_table}
+<form method="post" action="/invoice/create" class="filters" style="margin-top:10px"><input type=hidden name=contact_id value="{contact["id"]}"><input name=description required placeholder="Invoice description"><input name=amount type=number min="0.01" step="0.01" required placeholder="Amount (R)"><input name=due_on type=date required aria-label="Due date"><button class="btn primary">Create branded invoice</button></form>
+<form method="post" action="/payment/add" class="filters" style="margin-top:8px"><input type=hidden name=contact_id value="{contact["id"]}"><select name=invoice_id>{inv_opts}</select><input name=amount type=number min="0.01" step="0.01" required placeholder="Amount received (R)"><input name=paid_on type=date value="{date.today().isoformat()}" required><input name=reference placeholder="Bank / payment reference"><button class="btn">Record payment</button></form>
+<h3 style="margin-top:16px">Monthly fees and domain / hosting renewals</h3>{recurring_table}
+<form method="post" action="/recurring/save" class="filters" style="margin-top:10px"><input type=hidden name=contact_id value="{contact["id"]}"><select name=item_type><option value=hosting>Hosting</option><option value=retainer>Retainer</option><option value=domain_renewal>Domain renewal</option><option value=other>Other</option></select><input name=description placeholder="Service / domain"><input name=amount type=number min="0" step="0.01" required placeholder="Amount (R)"><select name=frequency><option value=monthly>Monthly</option><option value=annual>Annual</option></select><input name=next_due_on type=date aria-label="Next due"><button class="btn">Track recurring item</button></form></section>'''
+
+
+def _project_panel(contact: dict) -> str:
+    from crm import connect
+    with connect(db_path()) as conn:
+        row = conn.execute("SELECT * FROM crm_projects WHERE contact_id=? AND tenant_id=?", (contact["id"], tenant_id())).fetchone()
+    project = dict(row) if row else {}
+    opts = _select("status", ["waiting_content", "in_design", "in_build", "review", "live", "paused"], project.get("status", "waiting_content"),
+                   {"waiting_content":"Waiting for content", "in_design":"In design", "in_build":"In build", "review":"Client review", "live":"Live", "paused":"Paused"})
+    return f'''<section class="panel"><h2>Client project</h2><p class="note">Keep delivery state and renewal notes separate from the sales stage. Do not store passwords here; use a password manager.</p>
+<form method="post" action="/project/save" class="grid"><input type=hidden name=contact_id value="{contact["id"]}"><div class=field><label class=lab>Website build status</label>{opts}</div>
+<div class=field><label class=lab>Domain</label><input name=domain value="{h(project.get("domain",""))}" placeholder="example.co.za"></div>
+<div class=field><label class=lab>Started</label><input type=date name=started_on value="{h(project.get("started_on",""))}"></div><div class=field><label class=lab>Go-live date</label><input type=date name=go_live_on value="{h(project.get("go_live_on",""))}"></div>
+<div class=field><label class=lab>Next milestone</label><input name=next_milestone value="{h(project.get("next_milestone",""))}" placeholder="Content hand-off / design review"></div><div class=field><label class=lab>Milestone date</label><input type=date name=next_milestone_on value="{h(project.get("next_milestone_on",""))}"></div>
+<div class="field wide"><label class=lab>Hosting / access hand-off notes (no passwords)</label><textarea name=hosting_notes maxlength=4000>{h(project.get("hosting_notes",""))}</textarea></div><div class="field wide"><label class=lab>Project notes</label><textarea name=project_notes maxlength=4000>{h(project.get("project_notes",""))}</textarea></div><div class="actions wide"><button class="btn primary">Save project</button></div></form></section>'''
+
+
 def profile_page(contact_id: int, message: str = "") -> tuple[bytes, int]:
     tenant = tenant_id()
     c = get_contact(contact_id, db_path(), tenant)
@@ -646,7 +799,14 @@ def profile_page(contact_id: int, message: str = "") -> tuple[bytes, int]:
     retainer_options = "".join(f'<option value="{h(x.get("name"))}">' for x in p["retainers"])
 
     history_html = []
-    for item in histories:
+    for history_index, item in enumerate(histories):
+        previous = histories[history_index + 1] if history_index + 1 < len(histories) else None
+        try:
+            change = int(item["score"]) - int(previous["score"]) if previous and item.get("score") is not None and previous.get("score") is not None else None
+        except (TypeError, ValueError):
+            change = None
+        movement = (f'<span class="pill {"ok" if change >= 0 else "warn"}">{change:+d} points vs previous</span>' if change is not None else '<span class="pill">Baseline</span>')
+        report_month = str(item.get("audit_date", ""))[:7]
         pdf_link = (f'<a class="btn sm" href="/pdf/{item["id"]}">Download PDF</a>'
                     if item.get("pdf_path") and Path(item["pdf_path"]).is_file() else '<span class="pill warn">PDF missing</span>')
         scope_rows = []
@@ -660,8 +820,9 @@ def profile_page(contact_id: int, message: str = "") -> tuple[bytes, int]:
         client_report_panel = _client_report_panel(item)
         history_html.append(
             f'<div class="history" id="scope-{item["id"]}"><div class="actions"><b>{h(str(item["audit_date"])[:16].replace("T", " "))}</b>'
-            f'<span class="pill info">Score {h(item["score"])}/100</span><span class="pill">{h(item["confidence"])} confidence</span>'
-            f'<span class="pill accent">Quote {money(item["quote_amount"])}</span>{pdf_link}</div>'
+            f'<span class="pill info">Score {h(item["score"])}/100</span>{movement}<span class="pill">{h(item["confidence"])} confidence</span>'
+            f'<span class="pill accent">Quote {money(item["quote_amount"])}</span>{pdf_link}'
+            f'<form method="post" action="/monthly/report"><input type="hidden" name="contact_id" value="{c["id"]}"><input type="hidden" name="month" value="{h(report_month)}"><button class="btn sm">Monthly summary</button></form></div>'
             f'<details open><summary>Scope of Work: {done} of {total} done</summary>{"".join(scope_rows) or "<p class=muted>No action steps were generated.</p>"}</details>'
             f'<details><summary>Audit results and evidence</summary><pre>{h(json.dumps(item["summary"], indent=2, ensure_ascii=False))}</pre></details>'
             f'{client_report_panel}</div>')
@@ -677,6 +838,12 @@ def profile_page(contact_id: int, message: str = "") -> tuple[bytes, int]:
             f'<span class="pill {"ok" if c.get("outreach_allowed") else ""}">{"Outreach allowed" if c.get("outreach_allowed") else "Outreach off"}</span>'
             + ('<span class="pill dark">Not on Maps</span>' if c.get("found_via") == FINDER_SOURCE else ""))
     loc_bits = [x for x in (c.get("town"), c.get("sector")) if x]
+    score_block = ""
+    if histories:
+        latest = histories[0]
+        score_block = (f'<div class="score">{dial(latest.get("score"))}<div><div class="lab">Latest audit</div>'
+                       f'<div class="q">{money(latest.get("quote_amount"))}</div>'
+                       f'<div class="muted small">{h(str(latest.get("audit_date"))[:10])}</div></div></div>')
 
     name_attrs = 'readonly title="The name is fixed once a lead is created"'
     form = f'''<form method="post" action="/profile/save"><input type="hidden" name="id" value="{c["id"]}">
@@ -722,12 +889,110 @@ def profile_page(contact_id: int, message: str = "") -> tuple[bytes, int]:
 
     sources = "".join(f'<p><a target="_blank" rel="noreferrer" href="{h(u)}">{h(u)}</a></p>' for u in c.get("source_urls", [])) or '<p class="muted">No source links saved.</p>'
     meta_line = " &middot; ".join(h(x) for x in loc_bits)
+    activity_panel = _activity_panel(c, histories)
+    finance_panel = _finance_panel(c)
+    project_panel = _project_panel(c)
+    current_month = date.today().strftime("%Y-%m")
+    privacy_panel = f'''<section class="panel"><h2>Privacy &amp; record safety</h2><p class="note">Source recorded: <b>{h(c.get("found_via") or "not recorded")}</b>. Outreach permission is currently <b>{"allowed after owner checks" if c.get("outreach_allowed") else "off"}</b>.</p><form method="post" action="/privacy/opt-out"><input type="hidden" name="contact_id" value="{c["id"]}"><input type="hidden" name="reason" value="Client requested no further contact"><button class="btn">Record opt-out / do not contact</button></form><details style="margin-top:14px"><summary>Erase this contact and its saved reports</summary><p class="note">This permanently deletes the CRM record, timeline, finance and project records, audits, and associated report files. Only hashed do-not-contact identifiers remain. Make a backup first if required.</p><form method="post" action="/privacy/erase"><input type="hidden" name="contact_id" value="{c["id"]}"><label class="lab">Type DELETE to confirm</label><input name="confirmation" required autocomplete="off"><button class="btn" style="margin-top:8px">Permanently erase</button></form></details></section>'''
+    monthly_panel = f'''<section class="panel"><h2>Monthly client progress</h2><p class="note">Creates a concise branded PDF from a saved audit in the selected month. It includes score movement and priority work; it does not run a new audit.</p><form method="post" action="/monthly/report" class="filters"><input type="hidden" name="contact_id" value="{c["id"]}"><input type="month" name="month" value="{current_month}" required><button class="btn">Generate monthly report</button></form></section>'''
     body = f'''<div class="crumb"><a href="/">Leads</a> / {h(c["business_name"])}</div>{banner}
-<div class="phead">{avatar(c["business_name"], True)}<div class="who"><h1>{h(c["business_name"])}</h1><div class="muted">{meta_line}</div><div class="tags">{tags}</div>{f'<div class="chips" style="margin:10px 0 0">{soc_chips}</div>' if soc_chips else ''}</div></div>
+<div class="phead">{avatar(c["business_name"], True)}<div class="who"><h1>{h(c["business_name"])}</h1><div class="muted">{meta_line}</div><div class="tags">{tags}</div>{f'<div class="chips" style="margin:10px 0 0">{soc_chips}</div>' if soc_chips else ''}</div>{score_block}</div>
 <div class="profile"><div>{form}
+{activity_panel}{finance_panel}{project_panel}{monthly_panel}{privacy_panel}
 <section class="panel"><div class="panel-head"><h2>Audit history</h2><span>{len(histories)} on record</span></div>{"".join(history_html) or '<p class="muted">No audits yet. Verify the business and run one from the panel on the right.</p>'}</section>
 <section class="panel src-links"><h2>Source links</h2>{sources}</section></div>{aside}</div>'''
     return layout(c["business_name"], body, "leads", message, refresh), refresh
+
+
+# ---------------------------------------------------------------- audited businesses
+
+def audited_page(params: dict[str, str], message: str = "") -> bytes:
+    tenant = tenant_id()
+    q = (params.get("q") or "").strip().casefold()
+    band = params.get("band", "")
+    sort = params.get("sort", "recent")
+    rows_data = []
+    for c in list_contacts(db_path(), tenant_id=tenant, limit=5000):
+        try:
+            hist = audit_history(c["id"], db_path(), tenant)
+        except Exception:
+            hist = []
+        if not hist:
+            continue
+        latest = hist[0]
+        try:
+            score = float(latest.get("score"))
+        except (TypeError, ValueError):
+            score = None
+        steps = latest.get("scope_items", []) or []
+        rows_data.append({"c": c, "latest": latest, "count": len(hist), "score": score,
+                          "done": sum(bool(x.get("done")) for x in steps), "total": len(steps)})
+    everything = list(rows_data)
+    if q:
+        rows_data = [r for r in rows_data if q in " ".join(str(r["c"].get(k) or "") for k in ("business_name", "town", "sector", "website_url")).casefold()]
+    bands = {"high": lambda s: s is not None and s >= 75, "mid": lambda s: s is not None and 50 <= s < 75, "low": lambda s: s is not None and s < 50}
+    if band in bands:
+        rows_data = [r for r in rows_data if bands[band](r["score"])]
+    if sort == "score_low":
+        rows_data.sort(key=lambda r: (r["score"] is None, r["score"] if r["score"] is not None else 0))
+    elif sort == "score_high":
+        rows_data.sort(key=lambda r: -(r["score"] if r["score"] is not None else -1))
+    elif sort == "quote":
+        rows_data.sort(key=lambda r: -float(r["latest"].get("quote_amount") or 0))
+    else:
+        rows_data.sort(key=lambda r: str(r["latest"].get("audit_date") or ""), reverse=True)
+
+    scored = [r["score"] for r in everything if r["score"] is not None]
+    avg = round(sum(scored) / len(scored)) if scored else None
+    quote_total = sum(float(r["latest"].get("quote_amount") or 0) for r in everything)
+    steps_total = sum(r["total"] for r in everything)
+    steps_done = sum(r["done"] for r in everything)
+    kpis = (f'<div class="kpis">'
+            f'<div class="kpi"><div><div class="lab">Businesses audited</div><div class="num">{len(everything)}</div><div class="sub">latest audit counted</div></div></div>'
+            f'<div class="kpi blue"><div><div class="lab">Average score</div><div class="num">{avg if avg is not None else "n/a"}</div><div class="sub">out of 100</div></div>{dial(avg)}</div>'
+            f'<div class="kpi amber"><div><div class="lab">Quoted from audits</div><div class="num">{money(quote_total)}</div><div class="sub">once-off, latest quotes</div></div></div>'
+            f'<div class="kpi mint"><div><div class="lab">Scope done</div><div class="num">{steps_done}<small class="muted" style="font-size:15px"> / {steps_total}</small></div><div class="sub">action steps ticked off</div></div></div>'
+            f'</div>')
+    kpis = kpis.replace('class="kpis"', 'class="kpis" style="grid-template-columns:repeat(4,minmax(0,1fr))"')
+
+    def chip(label, key, value, n):
+        on = (params.get(key, "") == value) if value else not params.get("band")
+        keep = {k: v for k, v in params.items() if k in ("q", "sort") and v}
+        keep.update({key: value} if value else {})
+        qs = "&".join(f"{k}={quote(v)}" for k, v in keep.items())
+        return f'<a class="chip{" on" if on else ""}" href="/audited{"?" + qs if qs else ""}">{h(label)} <b>{n}</b></a>'
+    counts = {k: sum(1 for r in everything if f(r["score"])) for k, f in bands.items()}
+    chips = (chip("All", "band", "", len(everything)) + chip("75 and above", "band", "high", counts["high"])
+             + chip("50 to 74", "band", "mid", counts["mid"]) + chip("Under 50", "band", "low", counts["low"]))
+    sort_opts = "".join(f'<option value="{v}"{" selected" if sort == v else ""}>{h(label)}</option>' for v, label in
+                        (("recent", "Most recent"), ("score_low", "Lowest score first"), ("score_high", "Highest score first"), ("quote", "Biggest quote first")))
+
+    rows = []
+    for r in rows_data:
+        c, latest = r["c"], r["latest"]
+        pdf = (f'<a class="btn sm" href="/pdf/{latest["id"]}">PDF</a>'
+               if latest.get("pdf_path") and Path(str(latest["pdf_path"])).is_file() else '<span class="pill warn">PDF missing</span>')
+        pct = f'{r["done"]} of {r["total"]}' if r["total"] else "No steps"
+        more = f' <span class="muted small">({r["count"]} audits)</span>' if r["count"] > 1 else ""
+        rows.append(
+            f'<tr><td><div class="biz">{avatar(c["business_name"])}<div><a href="/contact/{c["id"]}">{h(c["business_name"])}</a>'
+            f'<div class="muted small">{h(c.get("town"))} &middot; {h(c.get("sector"))}</div></div></div></td>'
+            f'<td>{dial(r["score"], sm=True)}</td>'
+            f'<td class="nw"><b>{money(latest.get("quote_amount"))}</b></td>'
+            f'<td class="nw">{h(str(latest.get("audit_date"))[:10])}{more}</td>'
+            f'<td class="nw">{h(pct)}</td><td>{stage_pill(c.get("pipeline_stage"))}</td>'
+            f'<td><div class="row-actions">{pdf}<a class="btn sm" href="/contact/{c["id"]}#scope-{latest["id"]}">Scope of Work</a>'
+            f'<a class="btn sm" href="/contact/{c["id"]}">Open</a></div></td></tr>')
+    table = ('<div class="tbl-wrap"><table><thead><tr><th>Business</th><th>Score</th><th>Quote</th><th>Audited</th><th>Scope</th><th>Stage</th><th></th></tr></thead>'
+             f'<tbody>{"".join(rows) or "<tr><td colspan=7><div class=empty>No audited businesses match. Run an audit from a lead profile and it will appear here.</div></td></tr>"}</tbody></table></div>')
+    hidden = f'<input type="hidden" name="band" value="{h(band)}">' if band else ""
+    body = f'''<div class="head"><div><h1>Audited</h1><p>Every business that has an audit on record. Open one to see its scope of work, download the PDF or follow up.</p></div></div>
+{kpis}
+<div class="chips">{chips}</div>
+<form class="filters" method="get" action="/audited">{hidden}<input type="search" name="q" value="{h(params.get("q", ""))}" placeholder="Search audited businesses" aria-label="Search">
+<select name="sort" aria-label="Sort">{sort_opts}</select><button class="btn dark">Apply</button><a class="btn" href="/audited">Clear</a></form>
+<div class="muted small" style="margin-bottom:8px">Showing {len(rows_data)} of {len(everything)}</div>{table}'''
+    return layout("Audited", body, "audited", message)
 
 
 # ---------------------------------------------------------------- not listed
@@ -919,7 +1184,7 @@ def _redirect(self, location: str):
 
 
 def _read_form(self) -> dict:
-    size = min(int(self.headers.get("Content-Length", "0") or 0), 200_000)
+    size = min(int(self.headers.get("Content-Length", "0") or 0), 300_000)
     return parse_qs(self.rfile.read(size).decode("utf-8", "replace"), keep_blank_values=True)
 
 
@@ -947,6 +1212,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_body(200, main_page(params, params.get("message", "")))
         if path == "/health":
             return self.send_body(200, b'{"status":"ok"}', "application/json; charset=utf-8")
+        if path == "/audited":
+            return self.send_body(200, audited_page(params, params.get("message", "")))
+        if path in ("/queue", "/finance", "/projects", "/insights", "/bulk", "/privacy"):
+            import crm_pages
+            pages = {"/queue": crm_pages.audit_queue_page, "/finance": crm_pages.finance_page,
+                     "/projects": crm_pages.projects_page, "/insights": crm_pages.insights_page,
+                     "/bulk": crm_pages.bulk_page, "/privacy": crm_pages.compliance_page}
+            return self.send_body(200, pages[path](params.get("message", "")))
         if path == "/not-listed":
             return self.send_body(200, not_listed_page(params.get("message", "")))
         if path == "/job-status":
@@ -1010,6 +1283,29 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_body(404, b"PDF not found", "text/plain; charset=utf-8")
             except (ValueError, OSError):
                 return self.send_body(400, b"Invalid report id", "text/plain; charset=utf-8")
+        if path.startswith("/invoice/") and path.endswith("/pdf"):
+            try:
+                invoice_id = int(path.strip("/").split("/")[1])
+                from crm_ops import create_invoice_pdf
+                pdf = create_invoice_pdf(invoice_id, db_path=db_path(), tenant_id=tenant_id())
+                if pdf.is_file() and pdf.is_relative_to((PROJECT_DIR / "reports").resolve()):
+                    return self.send_body(200, pdf.read_bytes(), "application/pdf")
+                return self.send_body(404, b"Invoice not found", "text/plain; charset=utf-8")
+            except (ValueError, LookupError):
+                return self.send_body(404, b"Invoice not found", "text/plain; charset=utf-8")
+            except Exception as exc:
+                print("Invoice PDF generation failed:", type(exc).__name__, str(exc))
+                return self.send_body(500, b"Invoice PDF could not be generated", "text/plain; charset=utf-8")
+        if path.startswith("/monthly/"):
+            try:
+                _, _, cid, month = path.split("/", 3)
+                from crm_ops import create_monthly_report_pdf
+                pdf = create_monthly_report_pdf(int(cid), month, db_path=db_path(), tenant_id=tenant_id())
+                if pdf.is_file() and pdf.is_relative_to((PROJECT_DIR / "reports").resolve()):
+                    return self.send_body(200, pdf.read_bytes(), "application/pdf")
+                return self.send_body(404, b"Report not found", "text/plain; charset=utf-8")
+            except (ValueError, LookupError):
+                return self.send_body(404, b"Monthly report not available for that period", "text/plain; charset=utf-8")
         if path == "/export.csv":
             rows = list_contacts(db_path(), website_status=params.get("website_status", ""), town=params.get("town", ""),
                                  website_detail=params.get("website_detail", ""), stage=params.get("stage", ""),
@@ -1030,6 +1326,12 @@ class Handler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         if origin and origin != "null" and (urlparse(origin).hostname or "") not in ("127.0.0.1", "localhost", "::1"):
             return self.send_body(403, b"Blocked: this request came from another website", "text/plain; charset=utf-8")
+        try:
+            body_size = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            return self.send_body(400, b"Invalid request size", "text/plain; charset=utf-8")
+        if body_size < 0 or body_size > 300_000:
+            return self.send_body(413, b"Request too large", "text/plain; charset=utf-8")
         form = _read_form(self)
         data = {k: v[-1].strip() for k, v in form.items()}
         path = urlparse(self.path).path
@@ -1228,11 +1530,210 @@ class Handler(BaseHTTPRequestHandler):
                 return _redirect(self, f"/contact/{cid}?message=Audit+queued+job+{job_id}")
             except Exception as exc:
                 return _redirect(self, f"/contact/{cid}?message={quote(type(exc).__name__ + ': ' + str(exc))}")
+
+        if path == "/activity/add":
+            try:
+                from crm_ops import log_activity
+                cid = int(data.get("contact_id", "0"))
+                log_activity(cid, data.get("event_type", "call"), data.get("summary", ""), data.get("outcome", ""),
+                             data.get("channel", ""), data.get("direction", "outbound"), db_path(), tenant)
+                return _redirect(self, f"/contact/{cid}?message=Contact+activity+logged")
+            except Exception as exc:
+                cid = int(data.get("contact_id", "0") or 0)
+                return _redirect(self, f"/contact/{cid}?message=" + quote(f"Could not log activity: {exc}"[:160]))
+
+        if path == "/quote/create":
+            try:
+                from crm_ops import create_quote
+                cid = int(data.get("contact_id", "0"))
+                create_quote(cid, data.get("description", ""), float(data.get("amount", "0")), due_at=data.get("due_at", ""), db_path=db_path(), tenant_id=tenant)
+                return _redirect(self, f"/contact/{cid}?message=Quote+recorded")
+            except Exception as exc:
+                return _redirect(self, f"/contact/{int(data.get('contact_id','0') or 0)}?message=" + quote(f"Could not create quote: {exc}"[:160]))
+
+        if path == "/quote/status":
+            try:
+                from crm_ops import set_quote_status
+                set_quote_status(int(data.get("quote_id", "0")), data.get("status", ""), db_path(), tenant)
+                with connect(db_path()) as conn:
+                    row = conn.execute("SELECT contact_id FROM crm_quotes WHERE id=? AND tenant_id=?", (int(data["quote_id"]), tenant)).fetchone()
+                return _redirect(self, f"/contact/{row['contact_id']}?message=Quote+status+saved")
+            except Exception as exc:
+                return _redirect(self, "/finance?message=" + quote(f"Could not update quote: {exc}"[:160]))
+
+        if path == "/invoice/create":
+            try:
+                from crm_ops import create_invoice, create_invoice_pdf
+                cid = int(data.get("contact_id", "0"))
+                iid = create_invoice(cid, data.get("description", ""), float(data.get("amount", "0")), data.get("due_on", ""), db_path=db_path(), tenant_id=tenant)
+                create_invoice_pdf(iid, db_path=db_path(), tenant_id=tenant)
+                return _redirect(self, f"/contact/{cid}?message=Branded+invoice+created+-+see+Sales+and+billing")
+            except Exception as exc:
+                return _redirect(self, f"/contact/{int(data.get('contact_id','0') or 0)}?message=" + quote(f"Could not create invoice: {exc}"[:160]))
+
+        if path == "/payment/add":
+            try:
+                from crm_ops import record_payment
+                cid = int(data.get("contact_id", "0"))
+                invoice_id = int(data["invoice_id"]) if data.get("invoice_id", "").isdigit() else None
+                record_payment(cid, float(data.get("amount", "0")), data.get("paid_on", ""), invoice_id,
+                               "manual", data.get("reference", ""), db_path=db_path(), tenant_id=tenant)
+                return _redirect(self, f"/contact/{cid}?message=Payment+recorded+manually")
+            except Exception as exc:
+                return _redirect(self, f"/contact/{int(data.get('contact_id','0') or 0)}?message=" + quote(f"Could not record payment: {exc}"[:160]))
+
+        if path == "/recurring/save":
+            try:
+                from crm_ops import save_recurring_item
+                cid = int(data.get("contact_id", "0"))
+                save_recurring_item(cid, data.get("item_type", "other"), data.get("description", ""), float(data.get("amount", "0")),
+                                    data.get("frequency", "monthly"), data.get("next_due_on", ""), db_path=db_path(), tenant_id=tenant)
+                return _redirect(self, f"/contact/{cid}?message=Recurring+item+saved")
+            except Exception as exc:
+                return _redirect(self, f"/contact/{int(data.get('contact_id','0') or 0)}?message=" + quote(f"Could not save recurring item: {exc}"[:160]))
+
+        if path == "/recurring/paid":
+            try:
+                from crm_ops import mark_recurring_paid
+                mark_recurring_paid(int(data.get("item_id", "0")), date.today().isoformat(), db_path(), tenant)
+                return _redirect(self, "/finance?message=Payment+marked+paid+and+next+due+date+advanced")
+            except Exception as exc:
+                return _redirect(self, "/finance?message=" + quote(f"Could not mark recurring item paid: {exc}"[:160]))
+
+        if path == "/project/save":
+            try:
+                from crm_ops import save_project
+                cid = int(data.get("contact_id", "0"))
+                save_project(cid, data, db_path(), tenant)
+                return _redirect(self, f"/contact/{cid}?message=Project+status+saved")
+            except Exception as exc:
+                return _redirect(self, f"/contact/{int(data.get('contact_id','0') or 0)}?message=" + quote(f"Could not save project: {exc}"[:160]))
+
+        if path == "/audit/retry":
+            try:
+                from audit_queue import enqueue_audit
+                cid = int(data.get("contact_id", "0"))
+                job = enqueue_audit(cid, tenant, db_path())
+                return _redirect(self, f"/queue?message=Retry+queued+as+{job}")
+            except Exception as exc:
+                return _redirect(self, "/queue?message=" + quote(f"Retry not queued: {exc}"[:160]))
+
+        if path == "/audit/town":
+            if data.get("confirm") != "yes":
+                return _redirect(self, "/queue?message=Confirm+the+town+batch+before+queuing")
+            try:
+                limit = max(1, min(25, int(data.get("limit", "10"))))
+                from crm import list_contacts
+                from audit_queue import enqueue_audit
+                eligible = [c for c in list_contacts(db_path(), town=data.get("town", ""), tenant_id=tenant, limit=500)
+                            if c.get("details_verified") and c.get("website_detail") == "own_website_listed" and c.get("website_url")]
+                queued = failures = 0
+                for c in eligible[:limit]:
+                    try:
+                        enqueue_audit(c["id"], tenant, db_path())
+                        queued += 1
+                    except Exception:
+                        failures += 1
+                return _redirect(self, "/queue?message=" + quote(f"Queued {queued} audit(s); {failures} were skipped. Worker cost limits remain active."))
+            except Exception as exc:
+                return _redirect(self, "/queue?message=" + quote(f"Town queue failed: {exc}"[:160]))
+
+        if path == "/bulk/stage":
+            if data.get("confirm") != "yes":
+                return _redirect(self, "/bulk?message=Confirm+the+bulk+change")
+            try:
+                from crm_ops import bulk_update_stage
+                ids = [x for x in form.get("contact_id", []) if x.isdigit()]
+                changed = bulk_update_stage(ids, data.get("stage", ""), db_path(), tenant)
+                return _redirect(self, "/bulk?message=" + quote(f"Updated {changed} lead(s)."))
+            except Exception as exc:
+                return _redirect(self, "/bulk?message=" + quote(f"Bulk stage change failed: {exc}"[:160]))
+
+        if path == "/bulk/csv-preview":
+            try:
+                from crm_csv import preview_csv
+                import crm_pages
+                rows = preview_csv(data.get("csv_text", ""), db_path(), tenant)
+                if not rows:
+                    raise ValueError("No usable business-name rows found")
+                now = time.time()
+                for stale in [key for key, value in self.server.csv_imports.items() if now - value.get("created", 0) > 900]:
+                    self.server.csv_imports.pop(stale, None)
+                while len(self.server.csv_imports) >= 50:
+                    oldest = min(self.server.csv_imports, key=lambda key: self.server.csv_imports[key].get("created", 0))
+                    self.server.csv_imports.pop(oldest, None)
+                token = uuid.uuid4().hex
+                self.server.csv_imports[token] = {"rows": rows, "created": now}
+                return self.send_body(200, crm_pages.csv_preview_page(rows, token))
+            except Exception as exc:
+                return _redirect(self, "/bulk?message=" + quote(f"CSV preview failed: {exc}"[:160]))
+
+        if path == "/bulk/csv-commit":
+            if data.get("confirm") != "yes":
+                return _redirect(self, "/bulk?message=Review+and+confirm+every+CSV+row")
+            record = self.server.csv_imports.pop(data.get("token", ""), None)
+            if not record or time.time() - record.get("created", 0) > 900:
+                return _redirect(self, "/bulk?message=CSV+preview+expired;+preview+the+file+again")
+            try:
+                from crm_csv import commit_csv
+                actions = {str(r["row"]): data.get(f"action_{r['row']}", "skip") for r in record["rows"]}
+                result = commit_csv(record["rows"], actions, db_path(), tenant)
+                return _redirect(self, "/bulk?message=" + quote(f"CSV import: {result['added']} added, {result['merged']} filled, {result['skipped']} skipped."))
+            except Exception as exc:
+                return _redirect(self, "/bulk?message=" + quote(f"CSV import failed: {exc}"[:160]))
+
+        if path == "/website/sync":
+            try:
+                from netlify_crm_sync import sync_website_enquiries
+                result = sync_website_enquiries(db_path(), tenant)
+                message = f"Website enquiry sync: {result['imported']} imported/verified, {result['acknowledged']} acknowledged, {result['failed']} held for retry."
+                return _redirect(self, "/bulk?message=" + quote(message))
+            except Exception as exc:
+                return _redirect(self, "/bulk?message=" + quote(f"Website enquiry sync not completed: {exc}"[:180]))
+
+        if path == "/backup/create":
+            try:
+                from crm_ops import create_database_backup
+                out = create_database_backup(db_path())
+                return _redirect(self, "/privacy?message=" + quote(f"Verified private backup created: {out.name}"))
+            except Exception as exc:
+                return _redirect(self, "/privacy?message=" + quote(f"Backup failed: {exc}"[:160]))
+
+        if path == "/privacy/opt-out":
+            try:
+                from crm_ops import record_opt_out
+                cid = int(data.get("contact_id", "0"))
+                record_opt_out(cid, data.get("reason", "Client requested no further contact"), db_path(), tenant)
+                return _redirect(self, f"/contact/{cid}?message=Opt-out+recorded;+contact+suppressed+from+future+imports")
+            except Exception as exc:
+                return _redirect(self, f"/contact/{int(data.get('contact_id','0') or 0)}?message=" + quote(f"Could not record opt-out: {exc}"[:160]))
+
+        if path == "/privacy/erase":
+            try:
+                from crm_ops import erase_contact
+                cid = int(data.get("contact_id", "0"))
+                erase_contact(cid, data.get("confirmation", ""), db_path(), tenant)
+                return _redirect(self, "/privacy?message=CRM+record+and+saved+reports+erased;+hashed+do-not-contact+markers+retained")
+            except Exception as exc:
+                return _redirect(self, f"/contact/{int(data.get('contact_id','0') or 0)}?message=" + quote(f"Erasure not completed: {exc}"[:160]))
+
+        if path == "/monthly/report":
+            try:
+                cid = int(data.get("contact_id", "0"))
+                month = data.get("month", "")
+                from crm_ops import create_monthly_report_pdf
+                pdf = create_monthly_report_pdf(cid, month, db_path=db_path(), tenant_id=tenant)
+                return _redirect(self, f"/monthly/{cid}/{quote(month)}")
+            except Exception as exc:
+                return _redirect(self, f"/contact/{int(data.get('contact_id','0') or 0)}?message=" + quote(f"Monthly report not created: {exc}"[:160]))
+
         return self.send_body(404, b"Not found", "text/plain; charset=utf-8")
 
 
 def main():
     load_env()
+    if HOST not in ("127.0.0.1", "localhost", "::1"):
+        raise RuntimeError("The private CRM is intentionally restricted to localhost; do not expose it through a tunnel or network interface")
     tenant = tenant_id()
     migrate(db_path(), tenant)
     with tenant_context(tenant):
@@ -1243,6 +1744,7 @@ def main():
     print(f"Recovered queued audit jobs: {recovered}")
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.sweep_plans = {}
+    server.csv_imports = {}
     print(f"Straight Up Digital CRM at http://{HOST}:{PORT}/")
     print(f"SQLite: {DEFAULT_DB}")
     server.serve_forever()

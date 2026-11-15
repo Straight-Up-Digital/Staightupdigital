@@ -59,3 +59,31 @@ def publish_customer_report(report: dict, token: str | None = None, endpoint: st
     ):
         raise RuntimeError("The report service did not return a valid secure client report link.")
     return {"url": report_url, "expiresAt": str(result.get("expiresAt") or "")}
+
+
+def delete_published_report(report_url: str, token: str | None = None, endpoint: str | None = None) -> None:
+    """Revoke one owned report link before its CRM contact is erased."""
+    secret = (token if token is not None else env("AUDIT_REPORT_PUBLISH_TOKEN")).strip()
+    if not secret:
+        raise RuntimeError("Cannot erase this record safely until AUDIT_REPORT_PUBLISH_TOKEN is configured locally to revoke its online report.")
+    target = (endpoint or env("AUDIT_REPORT_PUBLISH_URL", DEFAULT_PUBLISH_URL)).strip()
+    target_parts = urlparse(target)
+    report_parts = urlparse(str(report_url or ""))
+    if target_parts.scheme != "https" or target_parts.hostname not in _ALLOWED_REPORT_HOSTS:
+        raise RuntimeError("The report revocation endpoint is not an approved Straight Up Digital HTTPS address.")
+    if report_parts.scheme != "https" or report_parts.hostname not in _ALLOWED_REPORT_HOSTS or not report_parts.path.startswith("/report/"):
+        raise ValueError("The report link is not an approved Straight Up Digital report.")
+    request = Request(
+        target,
+        data=json.dumps({"reportUrl": report_url}).encode("utf-8"),
+        headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json", "Accept": "application/json"},
+        method="DELETE",
+    )
+    try:
+        with urlopen(request, timeout=15) as response:
+            if response.status != 200:
+                raise RuntimeError(f"The report service returned HTTP {response.status}.")
+    except HTTPError as exc:
+        raise RuntimeError(f"Could not revoke the online report (HTTP {exc.code}); no local erasure was made.") from None
+    except URLError:
+        raise RuntimeError("Could not reach the report service; no local erasure was made.") from None

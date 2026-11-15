@@ -1,0 +1,36 @@
+# Straight Up Digital CRM upgrade
+
+## Scope and safeguards
+
+Build the requested eight upgrades into the existing private Python/SQLite CRM and its existing branded UI. Preserve current local edits in `crm_web.py`, `business_auditor.py`, and `audit_queue.py`; never overwrite the user's work. Keep the CRM and client records private and bound to `127.0.0.1`. Do not expose the CRM through a tunnel or deploy the Python CRM/database to Netlify. Netlify is only the public website/enquiry edge; payments remain manual and tracked, not processed. All database changes must be additive/migratory, tenant-scoped, and tested using temporary databases/synthetic records. Do not print existing client data.
+
+## Requested outcomes
+
+1. **Lead communication timeline:** dated call, WhatsApp, email and in-person entries with message/outcome; reusable personalised templates using business name and latest audit finding; one-click WhatsApp draft.
+2. **Quotes, invoices and payments:** quote lifecycle; branded invoice PDF; deposit/balance tracking; monthly payment status; hosting renewal dates and reminders. Track only; no payment collection or automatic billing.
+3. **Website enquiries:** safely capture enquiries into CRM with source `website`, deduplicate repeat deliveries, and preserve the website's existing email notifications. The local app must initiate any sync; no public CRM endpoint or client-data tunnel.
+4. **Audit progress and reporting:** compare previous/current scores and audit dates, re-audit workflow, and produce an owner-branded concise monthly report based on saved audits.
+5. **Queue and batch operations:** inspect queued/running/failed audits and retry failures; bulk stage changes; town-wide audit queueing; CSV import with duplicate review and conservative merge.
+6. **Won-client projects:** status and milestones (waiting for content / in design / live), domain/hosting notes, go-live date, and renewal/follow-up dates.
+7. **Safety and compliance:** one-click SQLite-consistent backup; retain lead source/consent/opt-out lineage; owner-confirmed erasure of contact and associated personal report data while retaining only suppression hashes where needed; require authentication before any future non-local CRM access.
+8. **Sales dashboard:** stage conversions, weighted/unweighted pipeline forecast, town/sector conversion indicators and response/follow-up timing.
+
+## Implementation sequence
+
+- **A. Foundation:** record a pre-migration SQLite backup; add tenant-scoped tables and migration-safe operations; regression tests; localhost-only guardrails.
+- **B. Daily selling:** activity timeline, personalised message templates, WhatsApp draft, quote/invoice/payment/renewal ledger, client project tracking.
+- **C. Operations and insights:** audit queue/retry/bulk actions, safe CSV duplicate-review/import, before/after audit comparison and monthly report, sales analytics.
+- **D. Privacy and website intake:** backup/export and confirmed erasure tools; authenticated website-enquiry sync that preserves Zoho email delivery, with exact Netlify configuration/deploy steps if production credits remain unavailable.
+- **E. Verification and handoff:** tests, local UI smoke checks, file/diff review, then GitHub sync only for code (never SQLite data, secrets, generated invoices or reports). Netlify deployment may remain blocked by the known production-credit limit; never publish the private CRM.
+
+## Progress
+
+- Baseline before changes: 55 tests passed, 3 subtests passed (15 Nov 2026).
+- Existing functionality already found: lead pipeline and follow-ups; audit history and score history; durable audit-job rows; CSV export; source URLs, consent fields and do-not-contact suppression list; local-only listener.
+- Working-tree edits preserved: `audit_queue.py`, `business_auditor.py`, and `crm_web.py` were modified before this task began.
+- **Local CRM implementation:** Completed. Added the timeline/templates, manual quotes/invoices/payments/renewals, delivery projects, audit queue/retry and bounded town batches, CSV file/paste preview with explicit duplicate decisions, score movement and monthly summaries, conversion/follow-up dashboard, SQLite backup, contact opt-out/erasure, and website-intake sync client. Website imports preserve consent/source separately, default outreach to off, and are idempotent without resetting a manually changed pipeline stage.
+- **Privacy boundaries:** Website enquiry sync is local-initiated over HTTPS; the public site has no direct access to the local CRM. The CRM refuses non-local listener addresses. Online report revocation is attempted before a typed-confirmation erasure; failure prevents local deletion so the owner can retry.
+- **Pre-change backup:** Created before adding the new tables. The backup and customer records are not included in Git.
+- **Local tests:** Full suite passes: 63 tests and 3 subtests. Python modules compile. Additional UI/browser smoke checks remain to run.
+- **Website source:** Added private production-only Netlify Blob capture after successful existing email delivery, plus an authenticated production-only read/ack API and report-revocation operation. Website unit suite passes (38 tests) and `npm run build` passes. Netlify Functions bundling and production behavior are not verified in this session because the Netlify CLI is not installed/authenticated.
+- **Remaining external setup:** Push the source changes to GitHub. A production Netlify deploy may still be skipped due to the known exhausted production credits. After a successful production deploy, add `CRM_ENQUIRY_SYNC_TOKEN` as a Functions-only, Production-only Netlify secret and the same value to the ignored local `.env`; see [`CRM_UPGRADE_SETUP.md`](CRM_UPGRADE_SETUP.md). No paid change was made and no production deployment was triggered.

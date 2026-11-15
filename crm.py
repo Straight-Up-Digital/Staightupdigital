@@ -85,6 +85,119 @@ CREATE TABLE IF NOT EXISTS audit_history (
     FOREIGN KEY(contact_id) REFERENCES contacts(id)
 );
 CREATE INDEX IF NOT EXISTS idx_audit_history_contact ON audit_history(contact_id, audit_date DESC);
+CREATE TABLE IF NOT EXISTS crm_activities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id TEXT NOT NULL,
+    contact_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    channel TEXT NOT NULL DEFAULT '',
+    direction TEXT NOT NULL DEFAULT 'outbound',
+    summary TEXT NOT NULL DEFAULT '',
+    outcome TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(contact_id) REFERENCES contacts(id)
+);
+CREATE INDEX IF NOT EXISTS idx_crm_activities_contact ON crm_activities(tenant_id, contact_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS crm_quotes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id TEXT NOT NULL,
+    contact_id INTEGER NOT NULL,
+    quote_number TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    amount REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','sent','accepted','declined','expired')),
+    sent_at TEXT NOT NULL DEFAULT '',
+    due_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(contact_id) REFERENCES contacts(id),
+    UNIQUE(tenant_id, quote_number)
+);
+CREATE INDEX IF NOT EXISTS idx_crm_quotes_contact ON crm_quotes(tenant_id, contact_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS crm_invoices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id TEXT NOT NULL,
+    contact_id INTEGER NOT NULL,
+    quote_id INTEGER,
+    invoice_number TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    amount REAL NOT NULL DEFAULT 0 CHECK(amount >= 0),
+    issued_on TEXT NOT NULL,
+    due_on TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'issued' CHECK(status IN ('issued','part_paid','paid','void')),
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(contact_id) REFERENCES contacts(id),
+    FOREIGN KEY(quote_id) REFERENCES crm_quotes(id),
+    UNIQUE(tenant_id, invoice_number)
+);
+CREATE INDEX IF NOT EXISTS idx_crm_invoices_due ON crm_invoices(tenant_id, status, due_on);
+CREATE TABLE IF NOT EXISTS crm_payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id TEXT NOT NULL,
+    contact_id INTEGER NOT NULL,
+    invoice_id INTEGER,
+    amount REAL NOT NULL CHECK(amount > 0),
+    paid_on TEXT NOT NULL,
+    method TEXT NOT NULL DEFAULT 'manual',
+    reference TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(contact_id) REFERENCES contacts(id),
+    FOREIGN KEY(invoice_id) REFERENCES crm_invoices(id)
+);
+CREATE INDEX IF NOT EXISTS idx_crm_payments_contact ON crm_payments(tenant_id, contact_id, paid_on DESC);
+CREATE TABLE IF NOT EXISTS crm_recurring_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id TEXT NOT NULL,
+    contact_id INTEGER NOT NULL,
+    item_type TEXT NOT NULL CHECK(item_type IN ('hosting','retainer','domain_renewal','other')),
+    description TEXT NOT NULL DEFAULT '',
+    amount REAL NOT NULL CHECK(amount >= 0),
+    frequency TEXT NOT NULL DEFAULT 'monthly' CHECK(frequency IN ('monthly','annual')),
+    next_due_on TEXT NOT NULL DEFAULT '',
+    last_paid_on TEXT NOT NULL DEFAULT '',
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(contact_id) REFERENCES contacts(id)
+);
+CREATE INDEX IF NOT EXISTS idx_crm_recurring_due ON crm_recurring_items(tenant_id, active, next_due_on);
+CREATE TABLE IF NOT EXISTS crm_projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id TEXT NOT NULL,
+    contact_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'waiting_content' CHECK(status IN ('waiting_content','in_design','in_build','review','live','paused')),
+    domain TEXT NOT NULL DEFAULT '',
+    hosting_notes TEXT NOT NULL DEFAULT '',
+    project_notes TEXT NOT NULL DEFAULT '',
+    started_on TEXT NOT NULL DEFAULT '',
+    go_live_on TEXT NOT NULL DEFAULT '',
+    next_milestone TEXT NOT NULL DEFAULT '',
+    next_milestone_on TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(contact_id) REFERENCES contacts(id),
+    UNIQUE(tenant_id, contact_id)
+);
+CREATE TABLE IF NOT EXISTS crm_website_enquiries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    business_name TEXT NOT NULL DEFAULT '',
+    contact_name TEXT NOT NULL DEFAULT '',
+    email TEXT NOT NULL DEFAULT '',
+    phone TEXT NOT NULL DEFAULT '',
+    message TEXT NOT NULL DEFAULT '',
+    form_type TEXT NOT NULL DEFAULT 'contact',
+    received_at TEXT NOT NULL,
+    consent_given INTEGER NOT NULL DEFAULT 0,
+    consent_text_version TEXT NOT NULL DEFAULT '',
+    consent_timestamp TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    contact_id INTEGER,
+    FOREIGN KEY(contact_id) REFERENCES contacts(id),
+    UNIQUE(tenant_id, external_id)
+);
+CREATE INDEX IF NOT EXISTS idx_crm_enquiries_received ON crm_website_enquiries(tenant_id, received_at DESC);
 """
 
 class ClosingConnection(sqlite3.Connection):
@@ -139,6 +252,10 @@ def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
     history_cols={row[1] for row in conn.execute("PRAGMA table_info(audit_history)")}
     for name,declaration in {"full_audit_json":"TEXT NOT NULL DEFAULT '{}'","scope_items_json":"TEXT NOT NULL DEFAULT '[]'","client_report_url":"TEXT NOT NULL DEFAULT ''","client_report_published_at":"TEXT NOT NULL DEFAULT ''"}.items():
         if name not in history_cols: conn.execute(f"ALTER TABLE audit_history ADD COLUMN {name} {declaration}")
+    enquiry_cols = {row[1] for row in conn.execute("PRAGMA table_info(crm_website_enquiries)")}
+    for name, declaration in {"consent_given":"INTEGER NOT NULL DEFAULT 0", "consent_text_version":"TEXT NOT NULL DEFAULT ''", "consent_timestamp":"TEXT NOT NULL DEFAULT ''", "source":"TEXT NOT NULL DEFAULT ''"}.items():
+        if name not in enquiry_cols:
+            conn.execute(f"ALTER TABLE crm_website_enquiries ADD COLUMN {name} {declaration}")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_contacts_town_stage ON contacts(town, pipeline_stage)")
     conn.commit()
     return conn
