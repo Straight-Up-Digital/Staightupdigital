@@ -6,18 +6,20 @@ The local CRM now includes the requested activity timeline and draft messages; q
 
 The public website keeps its existing Zoho email-delivery path. After a successful email send, the production function stores the enquiry in a private Netlify Blob queue. A separate authenticated production-only function returns those records only to the owner’s local CRM. The local CRM acknowledges (deletes) each remote item only after the SQLite import commits. The remote copy is not publicly readable, and the local sync does not grant marketing permission.
 
-## One required Netlify setting
+## Netlify configuration and deployment status
 
-The Netlify CLI is not installed or authenticated on this computer, so the production sync secret could not be added from this session. Also, the latest website source has not yet been deployed; until it is deployed, the private sync endpoint will not exist in production.
+On 15 November 2026, the Netlify connector added `CRM_ENQUIRY_SYNC_TOKEN` to the `straight-up-digital-site` project. Netlify's environment-variable page verifies it is marked as a secret, scoped to **Builds, Functions, and Runtime**, and set for **Production only** (deploy previews, branch deploys, preview runners, and local-development contexts are empty). The same random value is in the ignored local `C:\Users\Saint\business_auditor\.env`; neither copy is in Git or this file. The Netlify CLI is still not installed, but the authenticated Netlify connector was used to configure the project.
 
-When the Netlify deployment is available:
+The website source containing the private Netlify Blob queue and token-authenticated read/ack function has been pushed to GitHub but is not yet deployed to production. Netlify currently reports production deploys and Agent Runners are paused due to operational credits. No paid upgrade was made.
 
-1. In the `straight-up-digital-site` Netlify site, add an environment variable named `CRM_ENQUIRY_SYNC_TOKEN`. Restrict it to **Functions** scope and **Production** context only. Treat its value as a password. Do not add it to Git, a public build variable, chat, email, or this file.
-2. Generate a strong random token on the local computer, for example with Python: `python -c "import secrets; print(secrets.token_urlsafe(48))"`. Use the same value for the Netlify variable and `CRM_ENQUIRY_SYNC_TOKEN` in the ignored local `C:\Users\Saint\business_auditor\.env` file. Do not send the value to anyone or commit `.env`.
-3. Set `CRM_ENQUIRY_SYNC_URL` in that same local `.env` file to `https://straight-up-digital-site.netlify.app/api/private-enquiries` (or the verified production custom-domain equivalent).
-4. Open the local CRM and use **Bulk actions → Sync website enquiries now**. The result shows only aggregate imported/acknowledged/retry counts; enquiry content stays private. The primary Zoho notification continues as before.
+After production deploys resume:
 
-If Netlify production credits still prevent a deploy, wait for the credit reset or obtain explicit approval for a paid change before trying a production deploy. Do not use deploy previews to test this feature: the endpoint deliberately refuses non-production contexts, and production private data must not be exposed to previews.
+1. Deploy the already-pushed website source to the **Production** context. Do not deploy this feature to a preview or branch context: the endpoint intentionally refuses non-production contexts.
+2. Set `CRM_ENQUIRY_SYNC_URL` in the ignored local `.env` to `https://straight-up-digital-site.netlify.app/api/private-enquiries` (or the verified production custom-domain equivalent), if it is not already present.
+3. Open the local CRM and use **Bulk actions → Sync website enquiries now** with a synthetic enquiry. Verify one local import and remote acknowledgement, then confirm Zoho delivery is unchanged; the result shows only aggregate counts and enquiry content stays private.
+4. Test owner-authenticated report-link revocation against a synthetic report after deployment.
+
+Wait for the credit reset or get explicit approval before any paid change. Do not expose the local CRM through a tunnel or send the secret via chat, email, or Git.
 
 ## Privacy and billing boundaries
 
