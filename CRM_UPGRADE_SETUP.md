@@ -24,3 +24,16 @@ Wait for the credit reset or get explicit approval before any paid change. Do no
 ## Privacy and billing boundaries
 
 Quotes, invoices, payment records and recurring amounts are manual records only; the CRM does not process or accept money. The local backup is an ordinary private SQLite backup, not encrypted by this feature—protect the Windows account/device and backup folder accordingly. Erasure requires typing `DELETE`; if an owner-published report link exists, the local CRM first asks the production report service to revoke it. If that revocation cannot be confirmed, local erasure is stopped so the owner can retry safely.
+
+
+## Side-by-side Cloudflare Worker migration (not yet deployed)
+
+The website's `cloudflare-workers-migration` branch has a separate Worker implementation and passed local tests/build checks, but it has not been deployed to Cloudflare; Netlify remains the live platform and the CRM's existing Netlify secrets/URLs remain untouched. The local CRM now supports an optional exact account-specific `workers.dev` host with separate Cloudflare-only tokens and URLs. It rejects wildcard hosts and does not opt into Cloudflare unless `CLOUDFLARE_WORKER_HOST` is explicitly set.
+
+After a Cloudflare Worker has been deployed and its synthetic flows have passed, add these values only to the ignored local `.env` and the corresponding Cloudflare **Production** secret settings:
+
+- `CLOUDFLARE_WORKER_HOST=<worker-name>.<account-subdomain>.workers.dev` (hostname only; no scheme or path).
+- `CLOUDFLARE_CRM_ENQUIRY_SYNC_URL=https://<that-host>/api/private-enquiries` and `CLOUDFLARE_CRM_ENQUIRY_SYNC_TOKEN` matching the Worker secret `CRM_ENQUIRY_SYNC_TOKEN`.
+- `CLOUDFLARE_AUDIT_REPORT_PUBLISH_URL=https://<that-host>/api/publish-audit-report` and `CLOUDFLARE_AUDIT_REPORT_PUBLISH_TOKEN` matching the Worker secret `AUDIT_REPORT_PUBLISH_TOKEN`.
+
+Keep `CRM_ENQUIRY_SYNC_TOKEN`, `CRM_ENQUIRY_SYNC_URL`, `AUDIT_REPORT_PUBLISH_TOKEN`, and `AUDIT_REPORT_PUBLISH_URL` for the current Netlify production path until the owner separately approves a cutover. Use synthetic enquiries and reports for the Cloudflare test. Do not copy Netlify data, change DNS, or disable Netlify as part of this branch work.

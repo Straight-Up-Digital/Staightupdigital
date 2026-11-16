@@ -17,6 +17,30 @@ from crm_ops import save_website_enquiry
 from crm import DEFAULT_DB
 
 DEFAULT_URL = "https://straight-up-digital-site.netlify.app/api/private-enquiries"
+_DEFAULT_HOSTS = {
+    "straight-up-digital-site.netlify.app", "straightupdigital.co.za", "www.straightupdigital.co.za"
+}
+
+
+def _allowed_hosts() -> set[str]:
+    hosts = set(_DEFAULT_HOSTS)
+    raw = str(env("CLOUDFLARE_WORKER_HOST", "") or "").strip().lower()
+    if raw:
+        parsed = urllib.parse.urlparse(f"https://{raw}")
+        try:
+            port = parsed.port
+        except ValueError:
+            port = -1
+        labels = raw.split(".")
+        valid_labels = all(label and len(label) <= 63 and label[0] != "-" and label[-1] != "-"
+                           and all(char.isascii() and (char.isalnum() or char == "-") for char in label)
+                           for label in labels)
+        if (not raw.endswith(".workers.dev") or len(labels) < 4 or not parsed.hostname
+                or parsed.hostname != raw or parsed.netloc != raw or port is not None
+                or parsed.path or parsed.query or parsed.fragment or len(raw) > 253 or not valid_labels):
+            raise ValueError("CLOUDFLARE_WORKER_HOST must be one exact workers.dev hostname without a scheme, port, or path")
+        hosts.add(parsed.hostname)
+    return hosts
 
 
 def _request(url: str, token: str, method: str = "GET", body: dict | None = None) -> dict[str, Any]:
@@ -43,15 +67,23 @@ def _request(url: str, token: str, method: str = "GET", body: dict | None = None
 
 def sync_website_enquiries(db_path=None, tenant_id=None) -> dict[str, int]:
     load_env()
-    token = (env("CRM_ENQUIRY_SYNC_TOKEN", "") or "").strip()
-    base_url = (env("CRM_ENQUIRY_SYNC_URL", DEFAULT_URL) or DEFAULT_URL).strip().rstrip("/")
-    if not token:
-        raise RuntimeError("Local CRM_ENQUIRY_SYNC_TOKEN is not configured")
+    cloudflare_url = (env("CLOUDFLARE_CRM_ENQUIRY_SYNC_URL", "") or "").strip()
+    base_url = (cloudflare_url or env("CRM_ENQUIRY_SYNC_URL", DEFAULT_URL) or DEFAULT_URL).strip().rstrip("/")
     parsed = urllib.parse.urlparse(base_url)
-    if parsed.scheme != "https" or parsed.hostname not in {
-        "straight-up-digital-site.netlify.app", "straightupdigital.co.za", "www.straightupdigital.co.za"
-    } or parsed.path.rstrip("/") != "/api/private-enquiries":
+    try:
+        port = parsed.port
+    except ValueError:
+        port = -1
+    allowed_hosts = _allowed_hosts()
+    if (parsed.scheme != "https" or parsed.hostname not in allowed_hosts or parsed.username or parsed.password
+            or port is not None or parsed.query or parsed.fragment
+            or parsed.path.rstrip("/") != "/api/private-enquiries"):
         raise ValueError("CRM sync URL must be the approved Straight Up Digital HTTPS endpoint")
+    worker_host = str(env("CLOUDFLARE_WORKER_HOST", "") or "").strip().lower()
+    token_name = "CLOUDFLARE_CRM_ENQUIRY_SYNC_TOKEN" if worker_host and parsed.hostname == worker_host else "CRM_ENQUIRY_SYNC_TOKEN"
+    token = (env(token_name, "") or "").strip()
+    if not token:
+        raise RuntimeError(f"Local {token_name} is not configured")
 
     imported = acknowledged = failed = 0
     cursor = ""
