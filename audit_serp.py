@@ -1,17 +1,18 @@
-"""Budget-aware Google search provider fallback for audit research."""
+"""Budget-aware web-search provider fallback for audit research."""
 from __future__ import annotations
 
 import os
 from datetime import date, datetime
 from typing import Any, Callable
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
 
-_PROVIDERS = {"serpapi", "serper", "ddgs"}
+_PROVIDERS = {"serpapi", "serper", "searxng", "ddgs"}
 _SERPAPI_URL = "https://serpapi.com/search.json"
 _SERPER_URL = "https://google.serper.dev/search"
+_DEFAULT_PROVIDER_ORDER: tuple[str, ...] = ("serpapi", "searxng", "ddgs", "serper")
 
 
 def _normalize_results(results: Any, limit: int) -> list[dict[str, Any]]:
@@ -30,6 +31,7 @@ def _normalize_results(results: Any, limit: int) -> list[dict[str, Any]]:
                 "snippet": str(
                     result.get("snippet")
                     or result.get("body")
+                    or result.get("content")
                     or result.get("description")
                     or ""
                 ).strip(),
@@ -43,10 +45,10 @@ def _normalize_results(results: Any, limit: int) -> list[dict[str, Any]]:
 def _provider_order(value: str | None) -> list[str]:
     configured = [
         item.strip().lower()
-        for item in (value or "serpapi,serper,ddgs").replace(";", ",").split(",")
+        for item in (value or ",".join(_DEFAULT_PROVIDER_ORDER)).replace(";", ",").split(",")
         if item.strip().lower() in _PROVIDERS
     ]
-    return list(dict.fromkeys(configured)) or ["serpapi", "serper", "ddgs"]
+    return list(dict.fromkeys(configured)) or list(_DEFAULT_PROVIDER_ORDER)
 
 
 def _safe_error(exc: Exception, api_key: str = "") -> str:
@@ -89,6 +91,36 @@ def _query_provider(
     if payload.get("error"):
         raise RuntimeError(f"{provider} error: {payload['error']}")
     return _normalize_results(payload.get("organic_results") or payload.get("organic"), limit)
+
+
+def _searxng_search_url(base_url: str) -> str:
+    parsed = urlparse(base_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("SEARXNG_BASE_URL must be an HTTP(S) base URL without credentials, query, or fragment.")
+    if parsed.scheme == "http" and parsed.hostname.lower() not in {"localhost", "127.0.0.1", "::1"}:
+        raise ValueError("SEARXNG_BASE_URL must use HTTPS except for a localhost instance.")
+    return f"{base_url.rstrip('/')}/search"
+
+
+def _query_searxng(query: str, limit: int, search_url: str, client: Any) -> list[dict[str, Any]]:
+    response = client.get(
+        search_url,
+        params={"q": query, "format": "json", "pageno": 1},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        raise ValueError("SearXNG returned an invalid response.")
+    if payload.get("error"):
+        raise RuntimeError(f"SearXNG error: {payload['error']}")
+    return _normalize_results(payload["results"], limit)
 
 
 def web_search(
@@ -135,7 +167,7 @@ def web_search(
                     if callable(close):
                         close()
                 results = _normalize_results(raw, limit)
-                response = {
+                response: dict[str, Any] = {
                     "query": query,
                     "date": date.today().isoformat(),
                     "provider": "DDGS",
@@ -147,6 +179,31 @@ def web_search(
                 return response
             except Exception as exc:
                 errors.append({"provider": "DDGS", "error": _safe_error(exc)})
+                continue
+
+        if provider == "searxng":
+            base_url = os.getenv("SEARXNG_BASE_URL", "").strip()
+            if not base_url:
+                continue
+            try:
+                search_url = _searxng_search_url(base_url)
+                with client_factory(timeout=20) as client:
+                    results = _query_searxng(query, limit, search_url, client)
+                if not results:
+                    errors.append({"provider": "SearXNG", "error": "No results returned."})
+                    continue
+                response: dict[str, Any] = {
+                    "query": query,
+                    "date": date.today().isoformat(),
+                    "provider": "SearXNG",
+                    "results": results,
+                    "provider_errors": errors,
+                    "cached": False,
+                }
+                cache_put(cache_key, response)
+                return response
+            except Exception as exc:
+                errors.append({"provider": "SearXNG", "error": _safe_error(exc)})
                 continue
 
         api_key = keys.get(provider, "")

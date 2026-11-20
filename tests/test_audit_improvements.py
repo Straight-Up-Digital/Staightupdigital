@@ -193,6 +193,146 @@ def test_serp_search_falls_back_to_serper_and_redacts_provider_secrets(monkeypat
     assert used == ["serpapi", "serper"]
 
 
+def test_serp_search_uses_searxng_before_paid_fallback_when_serpapi_allowance_is_spent(monkeypatch):
+    monkeypatch.setenv("SERPAPI_API_KEY", "serpapi-secret")
+    monkeypatch.setenv("SERPER_API_KEY", "serper-secret")
+    monkeypatch.delenv("SERP_PROVIDER_ORDER", raising=False)
+    monkeypatch.setenv("SEARXNG_BASE_URL", "http://127.0.0.1:8080")
+    cache = {}
+    used = []
+    requests = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "results": [
+                    {
+                        "title": "Example local service",
+                        "url": "https://example.co.za/",
+                        "content": "A local business website.",
+                    }
+                ]
+            }
+
+    class Client:
+        def __init__(self, timeout=None):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, url, params=None, **kwargs):
+            requests.append((url, params))
+            return Response()
+
+        def post(self, *args, **kwargs):
+            raise AssertionError("Paid Serper should not run after SearXNG returns results")
+
+    result = audit_serp.web_search(
+        "plumber Port Alfred",
+        5,
+        cache_get=lambda key, age: cache.get(key),
+        cache_put=lambda key, value: cache.__setitem__(key, value),
+        usage_reserve=lambda kind, period, limit: used.append(kind) or False,
+        monthly_budget=100,
+        client_factory=Client,
+    )
+
+    assert result["provider"] == "SearXNG"
+    assert result["results"][0]["snippet"] == "A local business website."
+    assert requests == [
+        (
+            "http://127.0.0.1:8080/search",
+            {"q": "plumber Port Alfred", "format": "json", "pageno": 1},
+        )
+    ]
+    assert used == ["serpapi"]
+
+
+def test_searxng_refuses_cleartext_remote_endpoints_and_falls_through(monkeypatch):
+    monkeypatch.delenv("SERPAPI_API_KEY", raising=False)
+    monkeypatch.delenv("SERPER_API_KEY", raising=False)
+    monkeypatch.setenv("SEARXNG_BASE_URL", "http://search.example.org")
+
+    class Client:
+        def __init__(self, timeout=None):
+            raise AssertionError("An insecure remote endpoint must be rejected before connecting")
+
+    result = audit_serp.web_search(
+        "plumber Port Alfred",
+        5,
+        cache_get=lambda key, age: None,
+        cache_put=lambda key, value: None,
+        usage_reserve=lambda kind, period, limit: True,
+        monthly_budget=100,
+        client_factory=Client,
+        provider_order="searxng",
+    )
+
+    assert result["provider"] == "Unavailable"
+    assert "must use HTTPS" in result["provider_errors"][0]["error"]
+
+
+def test_empty_searxng_results_continue_to_ddgs(monkeypatch):
+    monkeypatch.delenv("SERPAPI_API_KEY", raising=False)
+    monkeypatch.delenv("SERPER_API_KEY", raising=False)
+    monkeypatch.setenv("SEARXNG_BASE_URL", "https://search.example.org")
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"results": []}
+
+    class Client:
+        def __init__(self, timeout=None):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, *args, **kwargs):
+            return Response()
+
+    class DDGS:
+        def text(self, query, max_results):
+            return [
+                {
+                    "title": "Fallback result",
+                    "href": "https://fallback.example/",
+                    "body": "Found through the free fallback.",
+                }
+            ]
+
+    result = audit_serp.web_search(
+        "plumber Port Alfred",
+        5,
+        cache_get=lambda key, age: None,
+        cache_put=lambda key, value: None,
+        usage_reserve=lambda kind, period, limit: True,
+        monthly_budget=100,
+        ddgs_class=DDGS,
+        client_factory=Client,
+        provider_order="searxng,ddgs",
+    )
+
+    assert result["provider"] == "DDGS"
+    assert result["results"][0]["title"] == "Fallback result"
+    assert result["provider_errors"] == [
+        {"provider": "SearXNG", "error": "No results returned."}
+    ]
+
+
 def test_pagespeed_mobile_desktop_and_crux_are_parsed_without_live_requests(monkeypatch):
     monkeypatch.setenv("PAGESPEED_ENABLED", "1")
     monkeypatch.setenv("PAGESPEED_CRUX", "1")

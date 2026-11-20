@@ -406,6 +406,12 @@ Observed integration paths:
   relevant API/billing configuration.
 - DDGS: free, unofficial search path. Do not promise availability or exact
   results.
+- SearXNG: optional self-hosted metasearch fallback for general organic web
+  results. Set SEARXNG_BASE_URL to the instance base URL and enable JSON output
+  in its settings; use HTTPS remotely. It relies on upstream engines and does
+  not replace Google Maps ratings/reviews or guarantee identical Google SERPs.
+  The default provider order tries SerpApi, configured SearXNG, DDGS, then the
+  paid Serper fallback.
 - OpenStreetMap Overpass: optional supplementary business search.
 - Public business websites: fetched with httpx; crawl limits and robots.txt
   behavior apply. DNS resolution fails closed, outbound connections are
@@ -421,6 +427,9 @@ Observed integration paths:
 
 Environment variable names in .env.example include:
 - SERPAPI_API_KEY
+- SERPER_API_KEY
+- SERP_PROVIDER_ORDER
+- SEARXNG_BASE_URL (optional self-hosted search instance; no API key)
 - CRM_ENCRYPTION_KEY_B64
 - CRM_SUPPRESSION_HMAC_KEY
 - CRM_TENANT_ID
