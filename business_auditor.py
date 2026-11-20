@@ -43,6 +43,13 @@ from urllib.parse import parse_qsl, quote_plus, unquote, urljoin, urlparse
 import httpcore
 import httpx
 from bs4 import BeautifulSoup
+import audit_presence
+import audit_priority
+import audit_serp
+import audit_signals
+import audit_speed
+import audit_urls
+from audit_text import trim_snippet
 from config_loader import env, load_env, pdf_template, prompt_config
 from resilient import retry_call, build_pdf_safely
 
@@ -124,15 +131,20 @@ DEFAULT_CONFIG = {
         "point_rate_zar": 40,
         "max_score_points": 100,
         "website_build_once_off_zar": 1500,
-        "website_hosting_monthly_zar": 99,
+        "website_hosting_monthly_zar": 129,
         "website_build_max_pages": 5,
         "audit_missing_point_zar": 40,
         "once_off_edits": {
-            "small_text_change_zar": 150,
-            "new_page_zar": 650,
-            "photo_swap_zar": 150,
-            "extra_form_zar": 350
+            "Quick text, price, or hours update": 150,
+            "Photo and gallery refresh": 200,
+            "New service page or promo banner": 350,
+            "Google Business Profile claim and cleanup": 450
         },
+        "hosting_tiers": [
+            {"name": "Starter Brand", "monthly_zar": 129, "annual_zar": 1290, "domain": ".co.za", "mailboxes": 2, "storage_gb": 2},
+            {"name": "Business Pro", "monthly_zar": 249, "annual_zar": 2490, "domain": ".co.za", "mailboxes": 10, "storage_gb": 10},
+            {"name": "Team Unlimited", "monthly_zar": 449, "annual_zar": 4490, "domain": ".co.za or .com", "mailboxes": "Unlimited", "storage_gb": 25}
+        ],
         "hourly_rate_zar": 650,
         "minimum_estimate_hours": 2,
         "task_hours": {
@@ -151,16 +163,16 @@ DEFAULT_CONFIG = {
         }
     },
     "monthly_retainers": [
-        {"name": "Fresh Start", "price_zar_month": 200, "scope": ["One monthly content idea", "Monthly listing and contact-detail check", "Short progress note"]},
-        {"name": "Steady Presence", "price_zar_month": 400, "scope": ["Two social/content ideas each month", "One profile or review-response check", "Monthly action list"]},
-        {"name": "Local Growth", "price_zar_month": 700, "scope": ["One short website update or FAQ each month", "Two social post drafts", "Local profile and review check", "Monthly progress note"]},
-        {"name": "Content Partner", "price_zar_month": 1000, "scope": ["Two website content updates or one article brief each month", "Four social post drafts", "Monthly SEO and profile check", "Monthly priorities call or written review"]},
-        {"name": "Digital Partner", "price_zar_month": 1500, "scope": ["Four agreed content updates or briefs each month", "Weekly social content prompts", "Monthly website, local-profile and review checks", "Monthly performance and next-step report"]}
+        {"name": "Basic Care", "price_zar_month": 249, "hosting_tier": "Starter Brand", "includes_hosting": True, "scope": ["Starter Brand hosting, .co.za domain, 2 mailboxes and 2 GB storage", "Monthly off-site backups and uptime monitoring", "One minor text or photo update per month"]},
+        {"name": "Local Visibility", "price_zar_month": 449, "hosting_tier": "Starter Brand", "includes_hosting": True, "scope": ["Everything in Basic Care", "Two Google Business Profile posts or photo updates per month", "Seasonal hours updates and monthly review monitoring"]},
+        {"name": "Active Growth", "price_zar_month": 699, "hosting_tier": "Business Pro", "includes_hosting": True, "scope": ["Business Pro hosting, .co.za domain, up to 10 mailboxes and 10 GB storage", "Everything in Local Visibility", "One local FAQ or service article and up to three website updates per month"]},
+        {"name": "Lead Builder", "price_zar_month": 1049, "hosting_tier": "Business Pro", "includes_hosting": True, "scope": ["Everything in Active Growth", "Weekly Google Business Profile updates and photo refreshes", "Quarterly digital presence re-score and fix recommendations"]},
+        {"name": "Full Digital Desk", "price_zar_month": 1549, "hosting_tier": "Team Unlimited", "includes_hosting": True, "scope": ["Team Unlimited hosting, .co.za or .com domain, unlimited mailboxes and 25 GB storage", "Everything in Lead Builder", "Priority same-day edits, reputation checks and monthly work summary"]}
     ],
     "website_offer": {
         "build_once_off_zar": 1500,
-        "hosting_monthly_zar": 99,
-        "guardrail": "Basic website scope and hosting limits must be agreed before sale; domain, email, paid plugins, substantial copywriting and major revisions may be extra."
+        "hosting_monthly_zar": 129,
+        "guardrail": "Five-page small-business website, R1,500 once-off. Hosting is a separate plan from R129/month unless included in a selected retainer. Confirm scope before sale; online stores and custom booking engines are excluded."
     },
 }
 
@@ -332,7 +344,169 @@ class PublicHTTPTransport(httpx.HTTPTransport):
         self._pool._network_backend = PublicNetworkBackend()  # pyright: ignore[reportPrivateUsage]
 
 
-def make_client(timeout: float = 18, verify: bool = True) -> httpx.Client:
+PAGESPEED_URL = audit_speed.PAGESPEED_URL
+
+
+def fetch_pagespeed(url: str, strategy: str = "mobile") -> dict:
+    """Compatibility wrapper for one PageSpeed Insights strategy."""
+    return audit_speed.fetch_pagespeed(url, strategy)
+
+
+def _doh(name: str, rtype: str) -> list[str]:
+    """Free DNS lookup over HTTPS (Cloudflare). Returns record strings, or [] on any problem."""
+    try:
+        r = httpx.get("https://cloudflare-dns.com/dns-query", params={"name": name, "type": rtype},
+                      headers={"accept": "application/dns-json"}, timeout=10)
+        if r.status_code != 200:
+            return []
+        return [str(a.get("data", "")).strip().strip('"') for a in (r.json().get("Answer") or []) if a.get("data")]
+    except Exception:
+        return []
+
+
+def _mail_provider(mx: list[str]) -> str:
+    blob = " ".join(mx).lower()
+    for needle, label in (("google", "Google Workspace"), ("outlook", "Microsoft 365"), ("protection.outlook", "Microsoft 365"),
+                          ("zoho", "Zoho Mail"), ("hostafrica", "HostAfrica"), ("xneelo", "Xneelo"), ("afrihost", "Afrihost"),
+                          ("mimecast", "Mimecast"), ("mailgun", "Mailgun")):
+        if needle in blob:
+            return label
+    return "Hosting company mail (cPanel or similar)" if mx else ""
+
+
+def fetch_site_health(start_url: str) -> dict:
+    """Technology clues, SSL expiry, email records and trust basics. Free, never raises."""
+    import re as _re, socket as _socket, ssl as _ssl
+    out = {"checked_at": datetime.now().isoformat(timespec="seconds"), "checked": True}
+    try:
+        host = (urlparse(start_url).hostname or "").lower()
+        if not host or not host_is_public(host):
+            return {"error": "Not a public address"}
+        apex = host[4:] if host.startswith("www.") else host
+        # homepage: technology, privacy policy, WhatsApp, analytics
+        try:
+            with make_client(timeout=20) as client:
+                resp = client.get(start_url)
+            html = resp.text[:600000].lower()
+            detected = audit_signals.detect_site_signals(html)
+            hdr = {k.lower(): v for k, v in resp.headers.items()}
+            out["homepage_status"] = resp.status_code
+            out["available"] = resp.status_code < 400
+            out["site_signals"] = detected
+            tech = []
+            for needle, label in (("wp-content", "WordPress"), ("elementor", "Elementor"), ("divi", "Divi"), ("cdn.shopify", "Shopify"),
+                                  ("wixstatic", "Wix"), ("squarespace", "Squarespace"), ("joomla", "Joomla"), ("weebly", "Weebly"),
+                                  ("godaddy", "GoDaddy builder"), ("webflow", "Webflow"), ("astro-island", "Astro"), ("__next", "Next.js")):
+                if needle in html and label not in tech:
+                    tech.append(label)
+            gen = _re.search(r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']([^"\']+)', html)
+            out["technology"] = tech
+            out["generator"] = (gen.group(1)[:60] if gen else "")
+            out["server"] = (hdr.get("server") or "")[:60]
+            out["powered_by"] = (hdr.get("x-powered-by") or "")[:60]
+            out["privacy_policy"] = detected["privacy_link"]
+            out["whatsapp_link"] = detected["whatsapp_link"]
+            out["analytics"] = detected["analytics"] or any(
+                x in html for x in ("plausible.io", "matomo")
+            )
+        except Exception as exc:
+            out["homepage_error"] = type(exc).__name__
+        # SSL expiry
+        if start_url.lower().startswith("https"):
+            try:
+                ctx = _ssl.create_default_context()
+                with _socket.create_connection((host, 443), timeout=10) as sock:
+                    with ctx.wrap_socket(sock, server_hostname=host) as tls:
+                        cert = tls.getpeercert()
+                exp = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
+                out["ssl_days_left"] = (exp - datetime.utcnow()).days
+            except Exception as exc:
+                out["ssl_error"] = type(exc).__name__
+        # email and DNS
+        mx = sorted(_doh(apex, "MX"))
+        txt = _doh(apex, "TXT")
+        dmarc = _doh("_dmarc." + apex, "TXT")
+        nameservers = sorted(_doh(apex, "NS"))
+        lookup_worked = bool(mx or txt or dmarc or nameservers)
+        posture = audit_signals.email_posture(mx, txt, dmarc, lookup_worked)
+        out["email_posture"] = posture
+        out["dns"] = {"mx": mx[:4], "mail_provider": _mail_provider(mx),
+                      "spf": any(t.lower().startswith("v=spf1") for t in txt),
+                      "dmarc": any(t.lower().startswith("v=dmarc1") for t in dmarc),
+                      "dmarc_policy": posture["dmarc_policy"],
+                      "nameservers": nameservers[:3], "lookup_worked": lookup_worked}
+    except Exception as exc:
+        out["error"] = f"Site health check could not run ({type(exc).__name__})"
+    return out
+
+
+def fetch_contact_details(start_url: str, pages: list | None = None) -> dict:
+    """Read the Contact and About pages for phone, email and address. Free, never raises."""
+    import json as _json, re as _re
+    from html import unescape as _unesc
+    out = {"emails": [], "phones": [], "address": "", "source_pages": []}
+    try:
+        parsed = urlparse(start_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        urls = []
+        for p in (pages or []):
+            u = p.get("url") or ""
+            if u and any(k in u.lower() for k in ("contact", "get-in-touch", "reach-us", "about", "find-us")):
+                urls.append(u)
+        for path in ("/contact", "/contact-us", "/contact-us/", "/contacts", "/get-in-touch", "/about", "/about-us"):
+            urls.append(origin + path)
+        urls = list(dict.fromkeys(urls))[:8]
+        emails, phones = [], []
+        with make_client(timeout=15) as client:
+            for u in urls:
+                html = fetch_plain(client, u)
+                if not html or "<html" not in html[:2000].lower() and "<body" not in html.lower():
+                    continue
+                out["source_pages"].append(u)
+                for m in _re.findall(r'href=["\']mailto:([^"\'?]+)', html, _re.I):
+                    emails.append(_unesc(m).strip())
+                for m in _re.findall(r'href=["\']tel:([^"\']+)', html, _re.I):
+                    phones.append(_unesc(m).strip())
+                text = _re.sub(r"<script.*?</script>|<style.*?</style>", " ", html, flags=_re.S | _re.I)
+                text = _unesc(_re.sub(r"<[^>]+>", " ", text))
+                emails += _re.findall(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", text)
+                phones += _re.findall(r"(?:\+27|0)\s?\d{2}[\s().-]?\d{3}[\s.-]?\d{4}", text)
+                for blob in _re.findall(r'<script[^>]+ld\+json[^>]*>(.*?)</script>', html, _re.S | _re.I):
+                    try:
+                        data = _json.loads(blob)
+                    except Exception:
+                        continue
+                    stack = data if isinstance(data, list) else [data]
+                    while stack:
+                        d = stack.pop()
+                        if isinstance(d, dict):
+                            if isinstance(d.get("@graph"), list):
+                                stack += d["@graph"]
+                            if d.get("telephone"):
+                                phones.append(str(d["telephone"]))
+                            if d.get("email"):
+                                emails.append(str(d["email"]).replace("mailto:", ""))
+                            a = d.get("address")
+                            if isinstance(a, dict) and not out["address"]:
+                                out["address"] = ", ".join(str(a.get(k)) for k in ("streetAddress", "addressLocality", "postalCode") if a.get(k))[:200]
+                            elif isinstance(a, str) and not out["address"]:
+                                out["address"] = a[:200]
+        bad = _re.compile(r"(\.(png|jpe?g|gif|svg|webp)$|^(noreply|no-reply|donotreply|sentry|wixpress|example)|@(sentry|wixpress|example)\.)", _re.I)
+        out["emails"] = list(dict.fromkeys(e for e in emails if e and not bad.search(e)))[:6]
+        cleaned = []
+        for ph in phones:
+            digits = _re.sub(r"\D", "", ph)
+            if digits.startswith("27") and len(digits) == 11:
+                digits = "0" + digits[2:]
+            if len(digits) == 10 and digits.startswith("0") and digits not in cleaned:
+                cleaned.append(digits)
+        out["phones"] = [f"{d[:3]} {d[3:6]} {d[6:]}" for d in cleaned[:4]]
+    except Exception as exc:
+        out["error"] = type(exc).__name__
+    return out
+
+
+def make_client(timeout: float = 18, verify=True) -> httpx.Client:
     return httpx.Client(headers={"User-Agent": USER_AGENT}, timeout=timeout, follow_redirects=True,
                         event_hooks={"request": [guard_request]}, transport=PublicHTTPTransport(verify=verify),
                         trust_env=False)
@@ -367,6 +541,7 @@ def get_bounded_response(client: httpx.Client, url: str, max_bytes: int) -> http
             headers=headers,
             content=bytes(content),
             request=response.request,
+            history=response.history,
         )
 
 
@@ -435,11 +610,7 @@ def clean_text(value) -> str:
 
 
 def normalize_url(url: str) -> str:
-    parsed = urlparse(url)
-    scheme = parsed.scheme.lower() or "https"
-    netloc = parsed.netloc.lower()
-    path = parsed.path.rstrip("/")
-    return f"{scheme}://{netloc}{path}"
+    return audit_urls.normalize_url(url)
 
 
 def normalize_input_url(url: str) -> str:
@@ -528,7 +699,8 @@ def collect_ld_types(node, out: set) -> None:
 def extract_page(url: str, client: httpx.Client) -> dict:
     try:
         response = get_bounded_response(client, url, MAX_RESPONSE_BYTES)
-        final_url = normalize_url(str(response.url))
+        response_url = str(response.url)
+        final_url = normalize_url(response_url)
         content_type = response.headers.get("content-type", "").lower()
         if response.status_code != 200:
             return {
@@ -596,15 +768,28 @@ def extract_page(url: str, client: httpx.Client) -> dict:
             "google.com/maps" in (frame.get("src") or frame.get("data-src") or "").lower()
             for frame in link_soup.find_all("iframe"))
         canonical = original_soup.find("link", rel=lambda x: x and "canonical" in x)
+        canonical_href = clean_text(canonical.get("href", "")) if canonical else ""
+        page_canonical = audit_urls.canonical_page_url(final_url, canonical_href)
         robots = original_soup.find("meta", attrs={"name": re.compile("^robots$", re.I)})
         images = original_soup.find_all("img")
         missing_alt = sum(1 for img in images if not clean_text(img.get("alt", "")))
         h1_count = len(original_soup.find_all("h1"))
+        site_signals = audit_signals.detect_site_signals(response.text)
+        history = list(getattr(response, "history", []) or [])
+        redirect_chain = []
+        for previous in history:
+            redirect_chain.append(
+                f"{audit_urls.safe_display_url(str(previous.request.url))} -> "
+                f"{audit_urls.safe_display_url(str(previous.url))}"
+            )
         return {
-            "success": True, "url": final_url, "status_code": response.status_code,
+            "success": True, "url": final_url, "canonical_url": page_canonical,
+            "canonical_key": audit_urls.canonical_key(page_canonical),
+            "status_code": response.status_code,
             "title": title, "description": description, "headings": headings,
             "links": links, "emails": sorted(emails), "text": body_text[:20000],
             "signals": {"ld_types": sorted(ld_types), "maps_embed": maps_embed},
+            "site_signals": site_signals,
             "site_name": site_name, "script_count": script_count,
             "town_guess": guess_town(full_text),
             "technical": {
@@ -616,7 +801,15 @@ def extract_page(url: str, client: httpx.Client) -> dict:
                 "image_count": len(images),
                 "images_missing_alt": missing_alt,
                 "response_bytes": len(response.content),
-                "https": final_url.startswith("https://")
+                "viewport_present": bool(
+                    original_soup.find("meta", attrs={"name": re.compile("^viewport$", re.I)})
+                ),
+                "https": urlparse(response_url).scheme.lower() == "https",
+                "https_redirect": (
+                    urlparse(url).scheme.lower() == "http"
+                    and urlparse(response_url).scheme.lower() == "https"
+                ),
+                "https_redirect_chain": redirect_chain,
             }
         }
     except Exception as exc:
@@ -663,23 +856,43 @@ def business_signals(text: str, pages: list[dict]) -> dict:
     }
 
 
-def _crawl_once(start_url: str, max_pages: int | None = None, insecure: bool = False) -> dict:
+def legacy_ssl_context():
+    """Read-only context for old servers: accepts old TLS versions and ciphers and skips certificate checks."""
+    import ssl as _ssl
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    try:
+        ctx.minimum_version = _ssl.TLSVersion.TLSv1
+    except Exception:
+        pass
+    try:
+        ctx.set_ciphers("DEFAULT:@SECLEVEL=0")
+    except Exception:
+        pass
+    ctx.options |= getattr(_ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
+    return ctx
+
+
+def _crawl_once(start_url: str, max_pages: int | None = None, insecure: bool = False, legacy: bool = False) -> dict:
     limit = max_pages or MAX_PAGES
     start_url = normalize_input_url(start_url)
     target_domain = urlparse(start_url).netloc
     queue = deque([start_url])
-    visited, pages, external_links = set(), [], set()
+    visited, canonical_seen, pages, external_links = set(), set(), [], set()
     robots_blocked = 0
     first_failure = ""
 
-    with (make_client(timeout=18, verify=False) if insecure else make_client(timeout=18)) as client:
+    with (make_client(timeout=18, verify=legacy_ssl_context()) if legacy else
+          make_client(timeout=18, verify=False) if insecure else make_client(timeout=18)) as client:
         parsed_start = urlparse(start_url)
         gate = RobotsGate(client, f"{parsed_start.scheme}://{parsed_start.netloc}")
         while queue and len(pages) < limit:
             url = normalize_url(queue.popleft())
-            if url in visited or ignored_url(url):
+            requested_key = audit_urls.canonical_key(url)
+            if requested_key in visited or ignored_url(url):
                 continue
-            visited.add(url)
+            visited.add(requested_key)
             if not gate.allowed(url):
                 robots_blocked += 1
                 continue
@@ -689,11 +902,15 @@ def _crawl_once(start_url: str, max_pages: int | None = None, insecure: bool = F
                 if not first_failure:
                     first_failure = page.get("error") or "unknown error"
                 continue
+            canonical_key = page.get("canonical_key") or audit_urls.canonical_key(page.get("url") or url)
+            if canonical_key in canonical_seen:
+                continue
+            canonical_seen.add(canonical_key)
             pages.append(page)
             for link in page.get("links", []):
                 link_url = link["url"]
                 if link["internal"]:
-                    if link_url not in visited and not ignored_url(link_url):
+                    if audit_urls.canonical_key(link_url) not in visited and not ignored_url(link_url):
                         if link["priority"]:
                             queue.appendleft(link_url)
                         else:
@@ -732,6 +949,11 @@ def _crawl_once(start_url: str, max_pages: int | None = None, insecure: bool = F
 def crawl_website(start_url: str, max_pages: int | None = None) -> dict:
     """Read the site. If its security certificate is not trusted, read it anyway (read only, nothing is sent)
     and flag the certificate problem, because visitors see a browser warning on such a site."""
+    if start_url.lower().startswith("http://"):
+        # A stored http:// address is often just how Google lists the site. Prefer its https version when that works.
+        https_try = _crawl_once("https://" + start_url[7:], max_pages)
+        if https_try.get("success"):
+            return https_try
     result = _crawl_once(start_url, max_pages)
     if not result.get("success") and "CERTIFICATE" in (result.get("first_failure") or "").upper():
         retry = _crawl_once(start_url, max_pages, insecure=True)
@@ -739,27 +961,37 @@ def crawl_website(start_url: str, max_pages: int | None = None) -> dict:
             retry["ssl_invalid"] = True
             retry["ssl_error"] = result.get("first_failure", "")
             return retry
+    fail = (result.get("first_failure") or "").upper()
+    if not result.get("success") and any(k in fail for k in ("SSL", "TLS", "EOF", "HANDSHAKE", "PROTOCOL")):
+        # The server dropped the secure connection (often an old server). Retry tolerantly, then plain http.
+        retry = _crawl_once(start_url, max_pages, legacy=True)
+        if not retry.get("success") and start_url.lower().startswith("https://"):
+            retry = _crawl_once("http://" + start_url[8:], max_pages, legacy=True)
+        if retry.get("success"):
+            retry["ssl_invalid"] = True
+            retry["ssl_error"] = "The server drops or refuses modern secure connections: " + (result.get("first_failure", "") or "")[:140]
+            return retry
     return result
 
 
 def public_search(query: str, max_results: int = SEARCH_RESULTS) -> dict:
-    if DDGS is None:
-        return {"success": False, "query": query, "results": [],
-                "error": "The ddgs package is not installed in this Python environment."}
-    try:
-        results = []
-        with DDGS() as search:
-            for item in search.text(query, max_results=max_results):
-                results.append({
-                    "title": clean_text(item.get("title", "")),
-                    "url": clean_text(item.get("href", "")),
-                    "snippet": clean_text(item.get("body", "")),
-                    "query": query
-                })
-        return {"success": True, "query": query, "results": results}
-    except Exception as exc:
-        return {"success": False, "query": query, "results": [],
-                "error": f"{type(exc).__name__}: {exc}"}
+    config = load_config()
+    budget = max(0, int(config.get("monthly_search_budget", DEFAULT_CONFIG["monthly_search_budget"])))
+    result = audit_serp.web_search(
+        query,
+        max_results,
+        cache_get=cache_get,
+        cache_put=cache_put,
+        usage_reserve=usage_reserve,
+        monthly_budget=budget,
+        ddgs_class=DDGS,
+    )
+    result["success"] = result.get("provider") != "Unavailable"
+    for item in result.get("results", []):
+        item["query"] = result.get("query", query)
+        item["provider"] = result.get("provider")
+        item["date"] = result.get("date")
+    return result
 
 
 NAME_GENERIC = {"the", "and", "restaurant", "guest", "house", "lodge", "hotel", "cafe", "salon", "studio", "wellness", "bar",
@@ -799,6 +1031,10 @@ def search_research(business_name: str, location: str, industry: str, website_do
     google_query = f'"{business_name}"{suffix} Google Business Profile OR Google Maps OR Google reviews'
     profile = industry_profile(industry)
     review_query = f'"{business_name}"{suffix} {profile["review_search"]}'
+    profile_query = (
+        f'"{business_name}"{suffix} Facebook OR Instagram OR LinkedIn OR TripAdvisor '
+        "OR Booking.com OR LekkeSlaap OR Airbnb"
+    )
     if profile["key"] == "accommodation":
         competitor_query = f'{industry or "guest house"} {location} accommodation'.strip()
     elif profile["key"] == "food":
@@ -811,11 +1047,16 @@ def search_research(business_name: str, location: str, industry: str, website_do
         "business_discovery": business_query,
         "google_discovery": google_query,
         "review_discovery": review_query,
-        "competitor_discovery": competitor_query
+        "competitor_discovery": competitor_query,
+        "profile_discovery": profile_query,
     }
     results = {}
     for key, query in queries.items():
         results[key] = public_search(query, 8)
+        for item in results[key].get("results", []):
+            item["query"] = query
+            item["provider"] = results[key].get("provider")
+            item["date"] = results[key].get("date")
         time.sleep(1.5)
     all_results = []
     for section in results.values():
@@ -1281,7 +1522,8 @@ def _serpapi_raw(business_name: str, town: str, website_domain: str) -> dict:
         "primary_type": category, "category": category,
         "business_status": "CLOSED_PERMANENTLY" if closed else "OPERATIONAL",
         "latest_review_age_days": None,
-        "other_candidates": [{"name": clean_text(x.get("title")), "website": x.get("website", "")}
+        "other_candidates": [{"name": clean_text(x.get("title")), "website": x.get("website", ""),
+                              "rating": x.get("rating"), "review_count": x.get("reviews") or x.get("user_ratings_total")}
                              for x in cands if x is not c][:4],
         "note": "" if chosen else "A listing was found but could not be confidently matched to this business, so it was not scored. Check it manually."
     }
@@ -1499,7 +1741,7 @@ def build_opportunities(research: dict, score: dict, external: dict, keywords: d
             "service_fit": "Social profile support"
         })
     g = external.get("google_places") or {}
-    google_priority = "High"
+    google_priority = "Medium"
     google_action = "Confirm the correct profile manually, check primary category, services, hours, service area, photos, website URL and review response process. Do not create a duplicate listing."
     if g.get("matched"):
         gscore = categories["Google Business Profile"]["score"]
@@ -1512,7 +1754,7 @@ def build_opportunities(research: dict, score: dict, external: dict, keywords: d
             gaps.append(f"photos ({g['photo_count']} found)")
         google_evidence = (f"Verified Google listing '{g.get('name')}' ({g.get('match_basis') or 'details entered by hand'}), rated {g.get('rating')} from {g.get('review_count')} reviews. Profile score {gscore}/20."
                            + (f" Possible gaps: {', '.join(gaps)}." if gaps else " No obvious gaps in the basics."))
-        google_priority = "High" if gscore < 14 else "Medium"
+        google_priority = "Medium"
         google_action = "Open the listing and fill any gaps, add recent photos, confirm categories and service area, and reply to reviews. Do not create a duplicate listing."
     elif g.get("status") == "unmatched_candidate":
         google_evidence = f"A Google listing named '{g.get('name')}' was found but its website did not match this site, so it was not scored."
@@ -1578,7 +1820,7 @@ def build_opportunities(research: dict, score: dict, external: dict, keywords: d
         "action": "Choose 5 to 10 relevant seed terms, validate them with Google Search Console or a keyword data provider, then map each priority term to a useful page and measure impressions, clicks and enquiries.",
         "service_fit": "SEO keyword research"
     })
-    return opportunities[:12]
+    return opportunities
 
 
 def infer_business_name(research: dict, url: str) -> str:
@@ -1757,7 +1999,7 @@ def package_suggestion(opportunities: list[dict], research: dict | None = None,
         "line_items": line_items,
         "scope": scope,
         "website_build_once_off_zar": int(website_offer.get("build_once_off_zar", 1500)) if not website_found else None,
-        "website_hosting_monthly_zar": int(website_offer.get("hosting_monthly_zar", 99)) if not website_found else None,
+        "website_hosting_monthly_zar": int(website_offer.get("hosting_monthly_zar", 129)) if not website_found else None,
         "monthly_retainer_options": monthly_retainer_options(audit),
         "unassessed_categories_excluded_from_breakdown": [item.get("category") for item in (scorecard or {}).get("categories", []) if item.get("score") is None],
         "guardrail": "Planning quote is R40 per point in the difference between the displayed audit score and 100; it is not a ranking or outcome guarantee. Category breakdown is normalized to the displayed score. Unassessed categories are not individually scored; review findings with the client. Larger needs are quoted after discussion and scope."
@@ -1860,7 +2102,9 @@ def site_extras(start_url: str) -> dict:
                             urls += re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", sub)
                 else:
                     urls += locs
-            out["sitemap_urls"] = sorted({normalize_url(u) for u in urls if not ignored_url(u)})[:500]
+            out["sitemap_urls"] = sorted(
+                audit_urls.dedupe_urls([u for u in urls if not ignored_url(u)])
+            )[:500]
             out["sitemap_found"] = bool(out["sitemap_urls"])
             llms = fetch_plain(client, origin + "/llms.txt", 4000)
             out["llms_txt"] = bool(llms) and "<html" not in llms[:300].lower()
@@ -2932,13 +3176,20 @@ def make_pdf(audit: dict) -> str:
     dial = ScoreDial(assessed, size=46*mm, track="#27302A", fill=score_colour(assessed, light_bg=False), text="#FFFFFF",
                      sub="#8E9A92", font=heading_bold, subfont=body_font)
     findings = len(audit.get("opportunities", []))
-    high = sum(1 for o in audit.get("opportunities", []) if o.get("priority") == "High")
+    finding_counts = audit.get("priority_counts") or audit_priority.priority_counts(
+        audit.get("opportunities", [])
+    )
+    high = finding_counts["High"]
     side = Table([
         [Paragraph("DIGITAL PRESENCE SCORE", styles["CoverLabel"])],
         [Paragraph("Across the categories we could verify. Not a sales-performance score.", styles["CoverFine"])],
         [Spacer(1, 3*mm)],
-        [Paragraph(f'<font color="#A8FF65"><b>{findings}</b></font> areas to improve'
-                   + (f', <font color="#FF6B5B"><b>{high}</b></font> high priority' if high else ""), styles["CoverValue"])],
+        [Paragraph(
+            f'<font color="#A8FF65"><b>{findings}</b></font> findings | '
+            f'<font color="#FF6B5B"><b>{high}</b></font> high | '
+            f'{finding_counts["Medium"]} medium | {finding_counts["Low"]} low',
+            styles["CoverValue"],
+        )],
     ], colWidths=[FW - 56*mm])
     side.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 0), ("TOPPADDING", (0, 0), (-1, -1), 1),
                               ("BOTTOMPADDING", (0, 0), (-1, -1), 1), ("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
@@ -2978,12 +3229,39 @@ def make_pdf(audit: dict) -> str:
         return t
     tiles = Table([[tile("Coverage", f"{score.get('assessment_coverage_percent', 0)}%"),
                     tile("Pages read", str(research.get("pages_researched", 0))),
-                    tile("Findings", str(findings))]], colWidths=[(FW - 48*mm) / 3] * 3)
+                    tile("Findings", f"{findings}\n{high} high / {finding_counts['Medium']} medium / {finding_counts['Low']} low")]],
+                  colWidths=[(FW - 48*mm) / 3] * 3)
     tiles.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
     hero = Table([[light_dial, tiles]], colWidths=[48*mm, FW - 48*mm])
     hero.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("LEFTPADDING", (0, 0), (-1, -1), 0)]))
     story += [hero, Spacer(1, 2*mm),
               Paragraph("The score covers assessed categories only. Categories marked Not scored had no verified data source. It is not a sales-performance score.", styles["Subtle"])]
+    pillars = audit.get("pillars") or audit_signals.build_pillars(audit)
+    if pillars:
+        story += [Spacer(1, 4*mm), Paragraph("Four audit pillars", styles["SubSection"])]
+        pillar_rows = []
+        for index in range(0, min(len(pillars), 4), 2):
+            row = []
+            for pillar in pillars[index:index + 2]:
+                row.append([
+                    Paragraph(f"<b>{ptext(pillar.get('name'))}</b>", styles["CardTitle"]),
+                    Paragraph(ptext(pillar.get("verdict")), styles["BodySmall"]),
+                    Paragraph(f"<b>Evidence:</b> {ptext(trim_snippet(pillar.get('evidence'), 170))}", styles["Subtle"]),
+                    Paragraph(f"<b>Next step:</b> {ptext(trim_snippet(pillar.get('fix'), 170))}", styles["Subtle"]),
+                ])
+            if len(row) == 1:
+                row.append("")
+            pillar_rows.append(row)
+        pillar_table = Table(pillar_rows, colWidths=[FW / 2, FW / 2], hAlign="LEFT")
+        pillar_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), soft_ivory),
+            ("BOX", (0, 0), (-1, -1), 0.5, border_color),
+            ("INNERGRID", (0, 0), (-1, -1), 0.5, border_color),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8), ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 8), ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ]))
+        story.append(pillar_table)
 
     rank = {"High": 0, "Medium": 1, "Low": 2}
     top_items = sorted(audit.get("opportunities", []), key=lambda o: rank.get(o.get("priority"), 3))[:3]
@@ -3016,6 +3294,37 @@ def make_pdf(audit: dict) -> str:
         rows.append([Paragraph(f"<b>{ptext(item.get('category'))}</b>", styles["TableText"]),
                      bar(item.get("score"), item.get("out_of", 1)),
                      Paragraph(f"<b>{ptext(value)}</b>", styles["TableText"]), P(item.get("status"))])
+    # ---------------- start here: one-page working brief
+    story.append(PageBreak())
+    story.append(sec("Start here: your working brief"))
+    story.append(Spacer(1, 3*mm))
+    _order = {"High": 0, "Medium": 1, "Low": 2}
+    _top = sorted(audit.get("opportunities", []) or [], key=lambda o: _order.get(o.get("priority"), 1))[:5]
+    _cats = [c for c in score.get("categories", []) if c.get("score") is not None and c.get("out_of")]
+    _weak = min(_cats, key=lambda c: c["score"] / c["out_of"]) if _cats else None
+    _pkg = audit.get("package_suggestion") or {}
+    _facts = [("Business", audit.get("business_name")), ("Website", audit.get("website")), ("Location", audit.get("location")),
+              ("Industry", audit.get("industry")), ("Assessed score", f"{assessed}/100" if assessed is not None else "Not scored"),
+              ("Biggest gap", f"{_weak['category']} ({_weak['score']}/{_weak['out_of']})" if _weak else "Not available"),
+              ("One-off quote", f"R{_pkg.get('estimated_price_zar')}" if _pkg.get("estimated_price_zar") is not None else "Not calculated")]
+    _ft = Table([[Paragraph(f"<b>{ptext(k)}</b>", styles["TableText"]), P(v)] for k, v in _facts], colWidths=[34*mm, FW - 34*mm])
+    _ft.setStyle(TableStyle([("LINEBELOW", (0, 0), (-1, -1), 0.4, colors.HexColor("#D9DED8")), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                             ("TOPPADDING", (0, 0), (-1, -1), 2.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5), ("LEFTPADDING", (0, 0), (-1, -1), 0)]))
+    story += [_ft, Spacer(1, 3*mm), Paragraph("Your top actions", styles["SubSection"])]
+    for _i, _op in enumerate(_top, 1):
+        _act = str(_op.get("action") or "")
+        _act = _act if len(_act) <= 125 else _act[:125].rsplit(" ", 1)[0] + "..."
+        _stripe = colors.HexColor(PRIORITY_COLOURS.get(_op.get("priority"), ("#687168",))[0])
+        story += [KeepTogether([card([Paragraph(f"<b>{_i}. {ptext(_op.get('title'))}</b>  <font color='{PRIORITY_COLOURS.get(_op.get('priority'), ('#687168',))[0]}' size='7.5'>{ptext(str(_op.get('priority') or '').upper())}</font>", styles["BodySmall"]),
+                                      Paragraph(ptext(_act), styles["Subtle"])], stripe=_stripe, pad=4)]), Spacer(1, 1*mm)]
+    story += [Spacer(1, 2*mm), Paragraph("Before you contact them", styles["SubSection"])]
+    for _line in ("Confirm the Google listing really is this business (name, address, phone).",
+                  "Check the review sites shown in the discovery section for the real ratings.",
+                  "Open the website on your phone and try the contact route yourself.",
+                  "Run a rankings check in the CRM and note the result before you call."):
+        story.append(Paragraph("\u2022 " + ptext(_line), styles["BodySmall"]))
+    story += [Spacer(1, 2*mm), Paragraph("<b>Part 1, do the work:</b> action plan, quote, 90-day roadmap. <b>Part 2, the evidence:</b> scorecard, discovery, competitors, SEO, strategy, measurement, limitations.", styles["Subtle"])]
+
     story.append(Spacer(1, 6*mm))
     story.append(sec("1. Scorecard and evidence"))
     story.append(styled_table(rows, [44*mm, 44*mm, 20*mm, FW - 108*mm], primary, border_color, pad=6))
@@ -3029,7 +3338,7 @@ def make_pdf(audit: dict) -> str:
             rows.append([
                 [Paragraph(f"<b>{ptext(clean_text(page.get('title') or page.get('url'))[:70])}</b>", styles["TableText"]),
                  Paragraph(ptext(clean_text(page.get("url"))[:70]), styles["Subtle"])],
-                P(clean_text(page.get("description") or "Not detected")[:200]),
+                P(trim_snippet(page.get("description") or "Not detected", 200)),
                 P(f"HTTPS {'yes' if tech.get('https') else 'no'}; title {'yes' if tech.get('title_present') else 'no'}; "
                   f"meta {'yes' if tech.get('meta_description_present') else 'no'}; H1 x{tech.get('h1_count')}; "
                   f"alt text missing {tech.get('images_missing_alt')}/{tech.get('image_count')}")])
@@ -3039,6 +3348,24 @@ def make_pdf(audit: dict) -> str:
     story.append(Spacer(1, 4*mm))
     story.append(sec("2. Public web discovery: Google and reviews"))
     story.append(Paragraph(ptext(ext.get("interpretation_note", "")), styles["BodySmall"]))
+    search_sets = ext.get("searches") or {}
+    search_rows = [[H("Search"), H("Exact query"), H("Provider / date")]]
+    for key, label in (
+        ("business_discovery", "Business"),
+        ("google_discovery", "Google listing"),
+        ("review_discovery", "Reviews"),
+        ("competitor_discovery", "Competitors"),
+        ("profile_discovery", "Profiles"),
+    ):
+        search = search_sets.get(key) or {}
+        if search.get("query"):
+            search_rows.append([
+                P(label),
+                P(trim_snippet(search.get("query"), 130)),
+                P(f"{search.get('provider') or 'Unavailable'} / {search.get('date') or 'date not recorded'}"),
+            ])
+    if len(search_rows) > 1:
+        story.append(styled_table(search_rows, [30*mm, FW - 75*mm, 45*mm], primary, border_color))
     gp = ext.get("google_places") or {}
     if gp.get("matched"):
         story.append(Paragraph(f"Verified Google listing ({ptext(google_source_label(gp))})", styles["SubSection"]))
@@ -3079,8 +3406,179 @@ def make_pdf(audit: dict) -> str:
         for item in items[:6]:
             rows.append([[Paragraph(f"<b>{ptext(clean_text(item.get('title') or 'Search result')[:80])}</b>", styles["TableText"]),
                           Paragraph(ptext(clean_text(item.get("url"))[:80]), styles["Subtle"])],
-                         P(clean_text(item.get("snippet"))[:260])])
+                         P(trim_snippet(item.get("snippet"), 260))])
         story.append(styled_table(rows, [70*mm, FW - 70*mm], primary, border_color))
+
+    # ---------------- 2b. speed, conversion, profiles and manual checks
+    story.append(Spacer(1, 4*mm))
+    story.append(Paragraph("Website speed and local checks", styles["SubSection"]))
+    _speed = audit.get("pagespeed") or {}
+    _mobile = _speed.get("mobile") or {}
+    _desktop = _speed.get("desktop") or {}
+    _local = _speed.get("local") or {}
+    _rows = [[H("Measure"), H("Mobile"), H("Desktop")]]
+    for _label, _key in (("Performance score (lab)", "score"),):
+        _rows.append([
+            P(_label),
+            P(f"{_mobile[_key]}/100" if _mobile.get(_key) is not None else "See local checks below"),
+            P(f"{_desktop[_key]}/100" if _desktop.get(_key) is not None else "See local checks below"),
+        ])
+    _crux = _speed.get("crux") or _mobile.get("crux") or _desktop.get("crux") or {}
+    for _label, _key in (("LCP", "lcp"), ("INP", "inp"), ("TBT", "tbt"), ("CLS", "cls")):
+        _lab = (_mobile.get("metrics") or {}).get(_key)
+        _desktop_lab = (_desktop.get("metrics") or {}).get(_key)
+        _field = _crux.get(_key) or {}
+        _mobile_value = _lab or (
+            f"Field p75 {_field.get('p75')}{_field.get('unit') or ''}"
+            if _field.get("p75") is not None else ""
+        )
+        if _mobile_value or _desktop_lab:
+            _rows.append([P(f"{_label} (lab/field)"), P(_mobile_value), P(_desktop_lab or "")])
+    for _label, _key in (("Accessibility", "accessibility"), ("Best practices", "best_practices"), ("SEO basics", "seo")):
+        _value = (_mobile.get("categories") or {}).get(_key)
+        _desktop_value = (_desktop.get("categories") or {}).get(_key)
+        if _value is not None or _desktop_value is not None:
+            _rows.append([
+                P(f"{_label} (lab)"),
+                P(f"{_value}/100" if _value is not None else ""),
+                P(f"{_desktop_value}/100" if _desktop_value is not None else ""),
+            ])
+    story.append(styled_table(_rows, [54*mm, 55*mm, FW - 109*mm], primary, border_color))
+    _local_rows = [[H("Local estimate"), H("Result")]]
+    for _label, _key, _suffix in (
+        ("Response time", "response_time_ms", " ms"),
+        ("TTFB estimate", "ttfb_ms", " ms"),
+        ("HTML size", "html_size_bytes", " bytes"),
+        ("Image count", "image_count", ""),
+        ("Images missing alt text", "images_missing_alt", ""),
+        ("Viewport meta tag", "viewport_present", ""),
+        ("HTTP-to-HTTPS redirect", "https_redirect", ""),
+        ("HTTPS redirect chain", "https_redirect_chain", ""),
+    ):
+        _value = _local.get(_key)
+        if _value is None:
+            continue
+        if _key in {"viewport_present", "https_redirect"}:
+            _value = "Found" if _value else "Not found"
+        elif _key == "https_redirect_chain":
+            _value = " ; ".join(_value) if _value else "No redirect observed"
+        else:
+            _value = f"{_value}{_suffix}"
+        _local_rows.append([P(_label), P(_value)])
+    if len(_local_rows) > 1:
+        story.append(styled_table(_local_rows, [54*mm, FW - 54*mm], primary, border_color))
+    elif _local.get("error"):
+        story.append(Paragraph(ptext(_local["error"]), styles["BodySmall"]))
+    _speed_errors = [
+        f"{label}: {result.get('error')}"
+        for label, result in (("Mobile PageSpeed", _mobile), ("Desktop PageSpeed", _desktop))
+        if result.get("error")
+    ]
+    if _speed_errors:
+        story.append(Paragraph(ptext(" | ".join(_speed_errors)), styles["Subtle"]))
+    story.append(Paragraph("PageSpeed values are lab results; CrUX values are field data when provided. Local checks are estimates, not Lighthouse scores.", styles["Subtle"]))
+
+    story += [Spacer(1, 3*mm), Paragraph("Technology, security and email posture", styles["SubSection"])]
+    _sh = audit.get("site_health") or {}
+    _d = _sh.get("dns") or {}
+    _signals = audit.get("site_signals") or {}
+    _yn = lambda value: "Yes" if value is True else ("No" if value is False else "Unknown")
+    _tech = ", ".join(_sh.get("technology") or []) or "Nothing recognisable"
+    if _sh.get("generator"):
+        _tech += " (generator: " + _sh["generator"] + ")"
+    _ssl = _sh.get("ssl_days_left")
+    _rows = [[H("Check"), H("Result")],
+             [P("Website platform"), P(_tech)],
+             [P("Server"), P(" ".join(x for x in (_sh.get("server"), _sh.get("powered_by")) if x) or "Not shown")],
+             [P("SSL certificate"), P(f"Valid, {_ssl} days left" if _ssl is not None else ("Could not be read" if _sh.get("ssl_error") else "Not checked"))],
+             [P("MX provider"), P(audit.get("email_posture", {}).get("mx_provider") or "Unknown")],
+             [P("SPF"), P(_yn(audit.get("email_posture", {}).get("spf_present")))],
+             [P("DMARC policy"), P(audit.get("email_posture", {}).get("dmarc_policy") or "Unknown")],
+             [P("Privacy / POPIA link"), P(_yn(_signals.get("privacy_link")))],
+             [P("Phone link"), P(_yn(_signals.get("tel_link")))],
+             [P("WhatsApp link"), P(_yn(_signals.get("whatsapp_link")))],
+             [P("GA4 / GTM / Meta Pixel"), P(
+                 f"GA4: {_yn(_signals.get('ga4'))}; GTM: {_yn(_signals.get('gtm'))}; "
+                 f"Meta Pixel: {_yn(_signals.get('meta_pixel'))}"
+             )]]
+    story.append(styled_table(_rows, [54*mm, FW - 54*mm], primary, border_color))
+    story.append(Paragraph("Before moving a domain, copy existing MX, SPF and DKIM records. Email and homepage signals are based on publicly available checks.", styles["Subtle"]))
+
+    _nap = audit.get("nap_comparison") or {}
+    if _nap:
+        story += [Spacer(1, 3*mm), Paragraph("Google-versus-website business details", styles["SubSection"])]
+        _rows = [[H("Field"), H("Website"), H("Google profile"), H("Result")]]
+        for _key in ("name", "phone", "address"):
+            _item = _nap.get(_key) or {}
+            _rows.append([
+                P(_key.title()),
+                P(_item.get("website") or "Not found"),
+                P(_item.get("google") or "Not found"),
+                P(_item.get("status") or "Not compared"),
+            ])
+        story.append(styled_table(_rows, [26*mm, 50*mm, 50*mm, FW - 126*mm], primary, border_color))
+
+    _profiles = audit.get("profile_presence") or []
+    if _profiles:
+        story += [Spacer(1, 3*mm), Paragraph("Social, travel and directory profiles", styles["SubSection"])]
+        _rows = [[H("Platform"), H("Status"), H("Profile URL"), H("Evidence")]]
+        for _profile in _profiles[:10]:
+            _rows.append([
+                P(_profile.get("platform")),
+                P(_profile.get("status")),
+                Paragraph(ptext(_profile.get("url") or ""), styles["Subtle"]),
+                P(_profile.get("match_reason")),
+            ])
+        story.append(styled_table(_rows, [28*mm, 38*mm, 50*mm, FW - 116*mm], primary, border_color))
+
+    _search_sets = ext.get("searches") or {}
+    _competitor_search = _search_sets.get("competitor_discovery") or {}
+    if _competitor_search:
+        _query = _competitor_search.get("query") or ""
+        _provider = _competitor_search.get("provider") or "Unavailable"
+        _date = _competitor_search.get("date") or "date not recorded"
+        story += [Spacer(1, 3*mm), Paragraph("Competitor search source", styles["SubSection"]),
+                  Paragraph(
+                      f"<b>Exact query:</b> {ptext(_query)} | <b>Provider:</b> {ptext(_provider)} | "
+                      f"<b>Date:</b> {ptext(_date)}",
+                      styles["BodySmall"],
+                  )]
+        _results = _competitor_search.get("results") or []
+        if _results:
+            _rows = [[H("Search result"), H("URL")]]
+            for _result in _results[:5]:
+                _rows.append([
+                    P(_result.get("title") or "Untitled result"),
+                    Paragraph(ptext(_result.get("url") or ""), styles["Subtle"]),
+                ])
+            story.append(styled_table(_rows, [60*mm, FW - 60*mm], primary, border_color))
+        elif _competitor_search.get("error"):
+            story.append(Paragraph(ptext(_competitor_search["error"]), styles["BodySmall"]))
+
+    story += [Spacer(1, 3*mm), Paragraph("Where the business shows up in search", styles["SubSection"])]
+    _rk = audit.get("rankings") or {}
+    if _rk.get("results"):
+        _rows = [[H("Search"), H("Position"), H("Map pack")]]
+        for _r in _rk["results"]:
+            _rows.append([P(_r.get("keyword")), P(f"#{_r['position']}" if _r.get("position") else "Not found"),
+                          P(f"#{_r['map_pack_position']}" if _r.get("map_pack_position") else "None")])
+        story.append(styled_table(_rows, [FW - 70*mm, 35*mm, 35*mm], primary, border_color))
+        _src = "Google (South Africa)" if _rk.get("source") == "serpapi" else "free search, indicative only"
+        story.append(Paragraph(f"Checked {ptext(str(_rk.get('generated_at', ''))[:10])} ({ptext(_src)}). One search on one day, so say when you searched.", styles["Subtle"]))
+    else:
+        story.append(Paragraph("No separate rank-tracking check was supplied.", styles["BodySmall"]))
+    story += [Spacer(1, 3*mm), Paragraph("Reviews and social pages (checked by hand)", styles["SubSection"])]
+    _pc = audit.get("platform_checks") or []
+    if _pc:
+        _rows = [[H("Platform"), H("Rating"), H("Reviews"), H("Followers"), H("Last activity")]]
+        for _x in _pc:
+            _rows.append([P(_x.get("label") or _x.get("platform")), P(_x.get("rating") if _x.get("rating") is not None else "-"),
+                          P(_x.get("review_count") if _x.get("review_count") is not None else "-"),
+                          P(_x.get("followers") if _x.get("followers") is not None else "-"), P(_x.get("last_activity") or "-")])
+        story.append(styled_table(_rows, [40*mm, 24*mm, 26*mm, 28*mm, FW - 118*mm], primary, border_color))
+        story.append(Paragraph("Typed in by hand from the public pages. Not independently verified.", styles["Subtle"]))
+    else:
+        story.append(Paragraph("No manual platform checks were entered for this run.", styles["BodySmall"]))
 
     # ---------------- 3. competitors
     story.append(Spacer(1, 4*mm))
@@ -3093,8 +3591,22 @@ def make_pdf(audit: dict) -> str:
         for item in competitors[:8]:
             rows.append([P(f"{clean_text(item.get('title') or 'Search result')[:50]}"),
                          Paragraph(ptext(clean_text(item.get("url")).replace("https://", "").replace("http://", "")[:48]), styles["Subtle"]),
-                         P(clean_text(item.get("snippet"))[:150])])
+                         P(trim_snippet(item.get("snippet"), 150))])
         story.append(styled_table(rows, [42*mm, 56*mm, FW - 98*mm], primary, border_color))
+    try:
+        _me = (audit.get("external_research") or {}).get("google_places") or {}
+        _cmp = [c for c in competitors if c.get("review_count") or c.get("rating")]
+        if _cmp and (_me.get("review_count") or _me.get("rating")):
+            story.append(Spacer(1, 3*mm))
+            story.append(Paragraph("You compared with nearby businesses (Google)", styles["SubSection"]))
+            _rows = [[H("Business"), H("Google rating"), H("Reviews")],
+                     [P("This business (" + clean_text(_me.get("name") or audit.get("business_name"))[:34] + ")"), P(_me.get("rating") or "-"), P(_me.get("review_count") if _me.get("review_count") is not None else "-")]]
+            for _c in sorted(_cmp, key=lambda x: -(x.get("review_count") or 0))[:5]:
+                _rows.append([P(clean_text(_c.get("title"))[:46]), P(_c.get("rating") or "-"), P(_c.get("review_count") if _c.get("review_count") is not None else "-")])
+            story.append(styled_table(_rows, [FW - 70*mm, 35*mm, 35*mm], primary, border_color))
+            story.append(Paragraph("Ratings and review counts as returned by Google Maps on the day of the audit.", styles["Subtle"]))
+    except Exception as _exc:
+        print("Competitor comparison skipped:", type(_exc).__name__, _exc)
     story.append(Spacer(1, 1.5*mm))
     story.append(Paragraph("These are search candidates, not a verified market-share or competitor-quality ranking. Manually confirm service overlap, location and current activity.", styles["Subtle"]))
 
@@ -3166,11 +3678,21 @@ def make_pdf(audit: dict) -> str:
     # ---------------- 6. action plan
     story.append(Spacer(1, 4*mm))
     story.append(sec("6. Prioritised action plan"))
+    story.append(Paragraph(
+        f"Finding counts: {finding_counts['High']} high, {finding_counts['Medium']} medium, "
+        f"{finding_counts['Low']} low.",
+        styles["Subtle"],
+    ))
     story.append(Spacer(1, 2*mm))
     for i, item in enumerate(audit.get("opportunities", []), 1):
         stripe = colors.HexColor(PRIORITY_COLOURS.get(item.get("priority"), ("#687168",))[0])
         body = [priority_tag(item.get("priority"), styles["Tag"]), Spacer(1, 1.5*mm),
                 Paragraph(f"{i}. {ptext(item.get('title'))}", styles["CardTitle"]),
+                Paragraph(
+                    f"Impact: {ptext(item.get('impact') or 'Not assessed')} | "
+                    f"Effort: {ptext(item.get('effort') or 'Not assessed')}",
+                    styles["Subtle"],
+                ),
                 Paragraph(f"<b>Evidence:</b> {ptext(item.get('evidence'))}", styles["BodySmall"]),
                 Paragraph(f"<b>Recommended action:</b> {ptext(item.get('action'))}", styles["BodySmall"]),
                 Paragraph(f"Potential service fit: {ptext(item.get('service_fit'))}", styles["Subtle"])]
@@ -3262,8 +3784,9 @@ def make_pdf(audit: dict) -> str:
         story.append(Paragraph("- " + ptext(limitation), styles["BodySmall"]))
     story.append(Paragraph("Source register", styles["SubSection"]))
     story.append(Paragraph("Website pages crawled during this run are listed below. Public search result links are listed in the discovery sections. Search snippets can be stale or ambiguous, so direct verification is required before making claims to the business owner.", styles["BodySmall"]))
-    for page in research.get("pages", []):
-        story.append(Paragraph(ptext(page.get("url")), styles["Subtle"]))
+    story.append(Paragraph(f"{research.get('pages_researched', len(research.get('pages', [])))} unique page(s) after URL canonicalization.", styles["Subtle"]))
+    for page in audit_urls.dedupe_pages(research.get("pages", [])):
+        story.append(Paragraph(ptext(page.get("canonical_url") or page.get("url")), styles["Subtle"]))
 
     footer_text = clean_text(brand.get("footer_text")) or f"{agency_name} | Evidence-led audit"
 
@@ -3286,9 +3809,33 @@ def make_pdf(audit: dict) -> str:
             if header_logo.is_file():
                 canvas.drawImage(str(header_logo), left_m, A4[1] - 9.8*mm, width=34*mm, height=8.6*mm,
                                  preserveAspectRatio=True, mask="auto")
-            canvas.setFont(body_bold, 7)
+            header_text = clean_text(business).upper() + "  |  GROWTH AUDIT"
+            header_size = 7.0
+            header_width = A4[0] - right_m - (left_m + 38*mm)
+            measured_width = pdfmetrics.stringWidth(header_text, body_bold, header_size)
+            if measured_width > header_width:
+                header_size = max(5.2, header_size * header_width / measured_width)
+                measured_width = pdfmetrics.stringWidth(header_text, body_bold, header_size)
+            if measured_width > header_width:
+                suffix = "  |  GROWTH AUDIT"
+                name = clean_text(business).upper()
+                available_name_width = max(
+                    0, header_width - pdfmetrics.stringWidth(suffix, body_bold, header_size)
+                )
+                words = name.split()
+                while words and pdfmetrics.stringWidth(" ".join(words) + "...", body_bold, header_size) > available_name_width:
+                    words.pop()
+                shortened = " ".join(words)
+                if shortened:
+                    header_text = shortened + "..." + suffix
+                else:
+                    prefix = name
+                    while prefix and pdfmetrics.stringWidth(prefix + "..." + suffix, body_bold, header_size) > header_width:
+                        prefix = prefix[:-1]
+                    header_text = prefix.rstrip() + "..." + suffix
+            canvas.setFont(body_bold, header_size)
             canvas.setFillColor(soft_ivory)
-            canvas.drawRightString(A4[0] - right_m, A4[1] - 6.4*mm, clean_text(business).upper()[:48] + "  |  GROWTH AUDIT")
+            canvas.drawRightString(A4[0] - right_m, A4[1] - 6.4*mm, header_text)
             canvas.setStrokeColor(border_color)
             canvas.setLineWidth(0.5)
             canvas.line(left_m, 13*mm, A4[0] - right_m, 13*mm)
@@ -3303,6 +3850,46 @@ def make_pdf(audit: dict) -> str:
                 canvas.setFont(body_font, 7)
             canvas.drawRightString(A4[0] - right_m, 8*mm, f"Page {document.page}")
         canvas.restoreState()
+
+    def part_bar(num, title, note):
+        t = Table([[Paragraph(f'<font color="#A8FF65"><b>PART {num}</b></font>&nbsp;&nbsp;&nbsp;<font color="#FFFFFF"><b>{title}</b></font>', styles["CardTitle"]),
+                    Paragraph(f'<font color="#C9D1C6">{note}</font>', styles["BodySmall"])]], colWidths=[66*mm, FW - 66*mm])
+        t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), primary), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                               ("LEFTPADDING", (0, 0), (-1, -1), 10), ("TOPPADDING", (0, 0), (-1, -1), 9), ("BOTTOMPADDING", (0, 0), (-1, -1), 9)]))
+        return t
+
+    try:
+        head, segs, cur = [], [], None
+        for fl in story:
+            if isinstance(fl, SectionBar):
+                cur = {"bar": fl, "items": [fl]}
+                segs.append(cur)
+            elif cur is None:
+                head.append(fl)
+            else:
+                cur["items"].append(fl)
+        by_num = {s["bar"].num: s for s in segs if s["bar"].num}
+        by_title = {s["bar"].title: s for s in segs if not s["bar"].num}
+        part1 = [by_num[n] for n in ("6", "8", "7") if n in by_num]
+        part2 = [by_num[n] for n in ("1", "2", "3", "4", "5") if n in by_num]
+        tail = [by_num[n] for n in ("9", "10") if n in by_num]
+        redesign = [by_title["Website redesign brief"]] if "Website redesign brief" in by_title else []
+        intro = [by_title[t] for t in ("Executive summary", "Start here: your working brief") if t in by_title]
+        if len(intro) == 2 and len(part1) + len(part2) + len(tail) == len(by_num) and len(by_num) >= 8:
+            new_story = list(head)
+            for s_ in intro:
+                new_story += s_["items"]
+            new_story += [PageBreak(), part_bar(1, "DO THE WORK", "What to fix, what to charge, and when."), Spacer(1, 4*mm)]
+            for s_ in part1:
+                new_story += s_["items"]
+            new_story += [PageBreak(), part_bar(2, "THE EVIDENCE", "How the score was reached and what it is based on."), Spacer(1, 4*mm)]
+            for s_ in part2 + redesign + tail:
+                new_story += s_["items"]
+            for counter, s_ in enumerate(part1 + part2 + tail, 1):
+                s_["bar"].num = str(counter)
+            story = new_story
+    except Exception as exc:
+        print("Report reorder skipped:", type(exc).__name__, exc)
 
     build_pdf_safely(lambda: doc.build(story, onFirstPage=page_decor, onLaterPages=page_decor), attempts=2)
     return str(path)
@@ -3419,7 +4006,7 @@ def sweep_competitor_leads(industry: str, town: str, own_domains: set, limit: in
                 best[d] = (reviews, {"title": clean_text(lead.get("business_name")) or d, "url": url,
                                      "snippet": f"Another {(clean_text(industry).split(',')[0] or 'local business').lower()} in {clean_text(data.get('town'))}, found on Google Maps"
                                                 + (f" ({reviews} Google reviews)" if reviews else ""),
-                                     "query": "town_sweep"})
+                                     "query": "town_sweep", "review_count": reviews or None, "rating": lead.get("rating")})
     ranked = sorted(best.values(), key=lambda x: -x[0])
     return [c for _, c in ranked[:limit]]
 
@@ -3537,7 +4124,7 @@ def run_audit(website: str, business_name: str = "", location: str = "", industr
         try:
             maps_leads.append({"title": clean_text(other.get("name")) or domain_of(site), "url": normalize_input_url(site),
                                "snippet": "Nearby business returned by the Google Maps lookup (a lead to verify)",
-                               "query": "google_maps"})
+                               "query": "google_maps", "rating": other.get("rating"), "review_count": other.get("review_count")})
         except ValueError:
             pass
     if maps_leads:
@@ -3580,7 +4167,15 @@ def run_audit(website: str, business_name: str = "", location: str = "", industr
             "action": ("Check that the business's own domain shows the site directly and is the address search engines "
                        "and customers see. Confirm which address is meant to be the main one before fixing anything else."),
             "service_fit": "Domain and hosting set-up"})
-    if website_research.get("ssl_invalid"):
+    _chain = "ISSUER" in clean_text(website_research.get("ssl_error")).upper() and "CERTIFICATE_VERIFY" in clean_text(website_research.get("ssl_error")).upper()
+    if website_research.get("ssl_invalid") and _chain:
+        opportunities.insert(0, {
+            "priority": "Medium", "title": "Check the website's certificate chain",
+            "evidence": ("This audit's connection could not complete the certificate chain (an intermediate certificate may be missing on the server). "
+                         "Many browsers still show the padlock in this case, so this may be a false alarm. Open the site in a browser before raising it with the owner."),
+            "action": "If a browser does warn, install the full certificate chain (the 'CA bundle') on the host. If not, ignore this item.",
+            "service_fit": "Hosting and security set-up"})
+    elif website_research.get("ssl_invalid"):
         apply_score_penalty(score, "Website structure", 4)
         opportunities.insert(0, {
             "priority": "High", "title": "The website's security certificate is not trusted",
@@ -3601,25 +4196,6 @@ def run_audit(website: str, business_name: str = "", location: str = "", industr
             "evidence": "The pages returned very little readable text and many scripts, which usually means the content is built in the browser with JavaScript. Basic crawlers, and sometimes search engines and AI tools, may see an almost empty page.",
             "action": "Test the main pages with Google Search Console URL Inspection or a text-only view. If key text is missing, ask the web developer about server-side rendering or a static version of the main pages.",
             "service_fit": "Technical SEO review"})
-    rank = {"High": 0, "Medium": 1, "Low": 2}
-    opportunities.sort(key=lambda o: rank.get(o["priority"], 3))
-    opportunities = opportunities[:10]
-    package = package_suggestion(opportunities, website_research, strategy, website_found=True,
-                                  assessed_score=score.get("assessed_score"), scorecard=score)
-    conf = assess_confidence(website_research, listing, external, comp_sites, town, js)
-
-    high_count = sum(1 for item in opportunities if item["priority"] == "High")
-    executive_summary = (
-        f"This audit reviewed {website_research.get('pages_researched', 0)} accessible website page(s) for {business_name}. "
-        f"The evidence-adjusted website presence score is {score.get('assessed_score')}/100 across assessed categories, "
-        f"with {score.get('assessment_coverage_percent')}% of the full scorecard assessed. "
-        f"It identified {len(opportunities)} areas to validate or improve, including {high_count} marked high priority. "
-        + (f"Google listing details and ratings came from the {google_source_label(listing)}. " if listing.get("matched")
-           else "Google profile quality and public review ratings/counts were not verified. ")
-        + (f"Note: {redirect['requested_domain']} redirects to {redirect['crawled_domain']}, and that is what was audited. " if redirect else "")
-        + "Keyword search volume and actual search rankings were not measured."
-        + (" Because the site appears to build its content with JavaScript, the website findings are unreliable until that is checked." if js else "")
-    )
     limitations = [
         "The crawler examined up to 20 same-domain HTML pages and respects robots.txt. Blocked pages, JavaScript-rendered content and pages requiring login may be missed.",
         "Public search results are discovery candidates, not confirmation of a business listing, current review rating/count, competitor relationship or current business status.",
@@ -3627,20 +4203,151 @@ def run_audit(website: str, business_name: str = "", location: str = "", industr
          if listing.get("matched") else "Google Business Profile completeness, ownership and performance were not verified."),
         "HelloPeter and Trustpilot ratings/counts must be checked against the exact business listing before being reported as facts. Google review recency is based on the few reviews the API returns.",
         "Keyword terms are extracted from the website or proposed as ideas. Search volume, keyword difficulty, rankings, impressions, clicks and traffic were not measured.",
-        "This is not a full Lighthouse/PageSpeed, backlink, analytics, legal, accessibility or security audit.",
+        "Website speed uses mobile and desktop PageSpeed tests when available, with local website estimates as a fallback. Technology, email and certificate checks read the home page and public DNS only. This is not a full backlink, analytics, legal, accessibility or security audit.",
         "The strategy section uses a light crawl of up to three competitor sites found through public search. It does not use keyword volume, rankings, Search Console or rank-tracking data, and AI search visibility was not tested directly.",
         "Scores and recommendations are directional observations, not proof of lost sales and not guarantees of results.",
         "Suggested service prices are draft packaging ideas. Confirm deliverables, time, third-party costs and client needs before quoting."
     ]
     limitations = [s.replace("HelloPeter and Trustpilot", industry_profile(industry)["review_platforms"]) for s in limitations]
+    step("Testing mobile and desktop speed and checking local fallbacks")
+    pagespeed = audit_speed.measure_website(
+        website, website_research, make_client, get_bounded_response, MAX_RESPONSE_BYTES
+    )
+    _ps = pagespeed["mobile"]
+    if _ps.get("score") is not None and _ps["score"] < 50:
+        opportunities.insert(0 if _ps["score"] < 40 else len(opportunities), {
+            "priority": "High" if _ps["score"] < 40 else "Medium", "title": "Speed up the website on phones",
+            "evidence": f"Google's PageSpeed test scored the mobile site {_ps['score']}/100. Slow pages lose visitors before they read anything.",
+            "action": "Compress large images, remove unused plug-ins and scripts, and ask the host about caching. Re-test after each change.",
+            "service_fit": "Website performance"})
+    step("Reading the Contact and About pages")
+    contact_details = fetch_contact_details(website_research["start_url"], website_research.get("pages"))
+    step("Checking security certificate, email records and technology")
+    site_health = fetch_site_health(website_research["start_url"])
+    _sh = site_health
+    _dns = _sh.get("dns") or {}
+    _days = _sh.get("ssl_days_left")
+    if _sh.get("homepage_status") in (404, 410) or (
+        isinstance(_sh.get("homepage_status"), int) and _sh["homepage_status"] >= 500
+    ):
+        opportunities.append({
+            "priority": "High",
+            "title": "The website home page is unavailable",
+            "evidence": f"The home page returned HTTP {_sh['homepage_status']} during the audit.",
+            "action": "Check the main domain and hosting status, then verify the page loads before promoting the website.",
+            "service_fit": "Website availability",
+        })
+    if _days is not None and _days < 30:
+        opportunities.insert(0, {"priority": "High", "title": "The security certificate is about to expire" if _days >= 0 else "The security certificate has expired",
+            "evidence": (f"The HTTPS certificate expires in {_days} days." if _days >= 0 else "The HTTPS certificate has already expired.") + " Visitors then see a full-page browser warning.",
+            "action": "Renew or switch on automatic renewal (free through Let's Encrypt or Cloudflare).", "service_fit": "Hosting and security set-up"})
+    if _dns.get("mx") and _dns.get("lookup_worked") and not (_dns.get("spf") and _dns.get("dmarc")):
+        _miss = " and ".join([n for n, ok in (("SPF", _dns.get("spf")), ("DMARC", _dns.get("dmarc"))) if not ok])
+        opportunities.append({"priority": "Medium", "title": "Protect the business email from spam filters and spoofing",
+            "evidence": f"The domain has email set up ({_dns.get('mail_provider') or 'mail servers found'}) but no {_miss} record. Without them, emails to customers are more likely to land in spam and anyone can fake the address.",
+            "action": "Add the missing records at the DNS host. Do this before any nameserver move so email keeps working.", "service_fit": "Email and domain set-up"})
+    if _sh.get("privacy_policy") is False:
+        opportunities.append({"priority": "Low", "title": "Add a privacy policy page",
+            "evidence": "No privacy or POPIA link was found on the home page. Sites that collect enquiries through a form are expected to have one.",
+            "action": "Add a short privacy policy and link it in the footer.", "service_fit": "Website content"})
+    if _sh.get("whatsapp_link") is False:
+        opportunities.append({"priority": "Low", "title": "Add a WhatsApp contact button",
+            "evidence": "No WhatsApp link was found on the home page. Many local customers prefer to message rather than call.",
+            "action": "Add a click-to-chat WhatsApp button to the header and contact page.", "service_fit": "Conversion improvements"})
+    page_signals = [page.get("site_signals") or {} for page in website_research.get("pages", [])]
+    signal_keys = (
+        "tel_link", "whatsapp_link", "privacy_link", "ga4", "gtm", "meta_pixel",
+        "analytics", "email_link", "phone_number", "email_address", "contact_form",
+    )
+    site_signals = {
+        key: any(signals.get(key) for signals in page_signals)
+        or bool((_sh.get("site_signals") or {}).get(key))
+        for key in signal_keys
+    }
+    site_signals["phone_number"] = site_signals["phone_number"] or bool(contact_details.get("phones"))
+    site_signals["email_address"] = site_signals["email_address"] or bool(contact_details.get("emails"))
+    site_signals["has_contact_route"] = any(
+        site_signals.get(key)
+        for key in (
+            "tel_link", "whatsapp_link", "email_link", "phone_number",
+            "email_address", "contact_form",
+        )
+    )
+    external_searches = external.get("searches") or {}
+    profile_search_results = [
+        item
+        for search in external_searches.values()
+        if isinstance(search, dict)
+        for item in search.get("results", [])
+    ]
+    website_phone = (
+        (contact_details.get("phones") or [""])[0]
+        or ((website_research.get("business_signals") or {}).get("phone_candidates") or [""])[0]
+    )
+    profile_presence = audit_presence.discover_profiles(
+        website_research.get("external_links", []),
+        profile_search_results,
+        business_name,
+        website_phone,
+    )
+    website_nap = {
+        "name": site_display_name(website_research),
+        "phone": website_phone,
+        "address": contact_details.get("address", ""),
+    }
+    google_nap = {
+        "name": clean_text(listing.get("name")),
+        "phone": clean_text(listing.get("phone")),
+        "address": clean_text(listing.get("address")),
+    }
+    nap_comparison = audit_signals.compare_nap(website_nap, google_nap)
+    email_posture = _sh.get("email_posture") or audit_signals.email_posture([], [], [], False)
+    priority_context = {
+        "pages": website_research.get("pages", []),
+        "signals": site_signals,
+        "google": listing,
+        "speed": pagespeed,
+        "site_health": site_health,
+        "ssl_invalid": bool(website_research.get("ssl_invalid")),
+        "site": {
+            "checked": bool(_sh.get("checked")),
+            "available": _sh.get("available"),
+            "status_code": _sh.get("homepage_status"),
+        },
+    }
+    opportunities = audit_priority.finalize_findings(
+        opportunities, priority_context, limit=20
+    )
+    priority_counts = audit_priority.priority_counts(opportunities)
+    package = package_suggestion(
+        opportunities, website_research, strategy, website_found=True,
+        assessed_score=score.get("assessed_score"), scorecard=score,
+    )
+    conf = assess_confidence(website_research, listing, external, comp_sites, town, js)
+    executive_summary = (
+        f"This audit reviewed {website_research.get('pages_researched', 0)} accessible website page(s) for {business_name}. "
+        f"The evidence-adjusted website presence score is {score.get('assessed_score')}/100 across assessed categories, "
+        f"with {score.get('assessment_coverage_percent')}% of the full scorecard assessed. "
+        f"It identified {len(opportunities)} areas to validate or improve: "
+        f"{priority_counts['High']} high, {priority_counts['Medium']} medium and {priority_counts['Low']} low priority. "
+        + (f"Google listing details and ratings came from the {google_source_label(listing)}. " if listing.get("matched")
+           else "Google profile quality and public review ratings/counts were not verified. ")
+        + (f"Note: {redirect['requested_domain']} redirects to {redirect['crawled_domain']}, and that is what was audited. " if redirect else "")
+        + "Search volume was not measured."
+        + (" Because the site appears to build its content with JavaScript, the website findings are unreliable until that is checked." if js else "")
+    )
     web_ok = any(sec.get("success") for sec in external.get("searches", {}).values())
     audit = {
         "success": True, "business_name": business_name, "website": website,
         "domain": domain, "location": location, "industry": industry,
         "generated_at": started, "executive_summary": executive_summary,
         "website_research": website_research, "external_research": external,
-        "keyword_research": keywords, "scorecard": score, "strategy": strategy,
+        "keyword_research": keywords, "pagespeed": pagespeed, "site_health": site_health, "contact_details": contact_details, "scorecard": score, "strategy": strategy,
         "opportunities": opportunities, "package_suggestion": package,
+        "priority_counts": priority_counts, "site_signals": site_signals,
+        "email_posture": email_posture, "nap_comparison": nap_comparison,
+        "website_nap": website_nap, "google_nap": google_nap,
+        "profile_presence": profile_presence,
         "limitations": limitations, "confidence": conf, "redirect": redirect,
         "data_sources": {
             "website_crawl": f"{website_research.get('pages_researched', 0)} page(s) read" + (" (looks JavaScript-rendered)" if js else ""),
@@ -3651,6 +4358,7 @@ def run_audit(website: str, business_name: str = "", location: str = "", industr
             "sitemap_found": bool(extras.get("sitemap_found")), "robots_txt_found": bool(extras.get("robots_found"))},
         "draft_notice": "DRAFT: verify before sending" if conf["level"] == "Low" else ""
     }
+    audit["pillars"] = audit_signals.build_pillars(audit)
     audit["package_suggestion"]["monthly_retainer_options"] = monthly_retainer_options(audit)
     audit["website_redesign_brief"] = build_redesign_brief(
         website_research, strategy, keywords, opportunities, business_name, website
@@ -3704,10 +4412,18 @@ def summary_view(audit: dict) -> dict:
         "business_name": audit.get("business_name"), "website": audit.get("website"),
         "location": audit.get("location"), "industry": audit.get("industry"), "generated_at": audit.get("generated_at"),
         "confidence": audit.get("confidence"), "data_sources": audit.get("data_sources"),
+        "priority_counts": audit.get("priority_counts") or audit_priority.priority_counts(
+            audit.get("opportunities", [])
+        ),
+        "pillars": audit.get("pillars") or audit_signals.build_pillars(audit),
+        "nap_comparison": audit.get("nap_comparison"),
+        "email_posture": audit.get("email_posture"),
+        "profile_presence": audit.get("profile_presence"),
         "score": {"assessed_score": sc.get("assessed_score"), "coverage_percent": sc.get("assessment_coverage_percent"),
                   "categories": [{k: c.get(k) for k in ("category", "score", "out_of", "status")} for c in sc.get("categories", [])]},
         "google_listing": {k: g.get(k) for k in ("status", "matched", "name", "address", "rating", "review_count", "maps_url", "source_label", "note")},
-        "top_findings": [{"priority": o["priority"], "title": o["title"], "evidence": o["evidence"], "recommended_action": o["action"]}
+        "top_findings": [{"priority": o["priority"], "impact": o.get("impact"), "effort": o.get("effort"),
+                          "title": o["title"], "evidence": o["evidence"], "recommended_action": o["action"]}
                          for o in audit.get("opportunities", [])[:6]],
         "service_pages_missing": [m["service"] for m in st.get("service_coverage", []) if not m["dedicated_page"]][:10],
         "ai_search_checks_to_fix": [c["check"] for c in st.get("ai_search_readiness", []) if c["status"] == "Fix"],

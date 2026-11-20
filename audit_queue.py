@@ -18,15 +18,19 @@ def _detected_details(audit:dict,contact:dict)->dict:
     signals=research.get("business_signals") or {}
     out={}
     host=re.sub(r"^www\.","",(research.get("domain") or "").lower())
-    emails=[e for e in signals.get("emails",[]) if not _BAD_MAIL.search(e)]
+    cd=audit.get("contact_details") or {}
+    emails=[e for e in (list(cd.get("emails") or [])+list(signals.get("emails",[]))) if not _BAD_MAIL.search(e)]
     emails.sort(key=lambda e:(0 if host and e.lower().endswith("@"+host) else 1))
     if emails and not (contact.get("email") or "").strip():
         out["email"]=emails[0]
     phones=signals.get("phone_candidates") or []
     google_phone=((audit.get("external_research") or {}).get("google_places") or {}).get("phone")
     if not (contact.get("phone") or "").strip():
-        found=google_phone or (phones[0] if phones else "")
+        found=(cd.get("phones") or [None])[0] or google_phone or (phones[0] if phones else "")
         if found:out["phone"]=str(found).strip()
+    if not (contact.get("address") or "").strip():
+        addr=cd.get("address") or ((audit.get("external_research") or {}).get("google_places") or {}).get("address") or ""
+        if addr:out["address"]=str(addr).strip()[:200]
     have=[u for u in (contact.get("social_links") or []) if u]
     seen={u.lower().rstrip("/") for u in have}
     new=[]
@@ -72,6 +76,10 @@ def _run_one(job_id:str,tenant_id:str,contact_id:int,db_path:Path):
         audit["prompt_config_version"]=prompt_bundle.get("version")
         audit["prompt_policy_name"]=prompt_bundle.get("name")
         audit["package_suggestion"]["monthly_retainer_options"]=monthly_retainer_options(audit)
+        try:
+            from crm_tools import audit_extras
+            audit.update(audit_extras(contact_id,db_path,tenant_id))
+        except Exception as exc:print(f"Audit job {job_id}: could not attach rankings and platform checks: {exc}")
         pdf=Path(make_pdf(audit))
         store_dir=Path(env("CRM_LOCAL_STORAGE_DIR","reports/objects"))
         if not store_dir.is_absolute():store_dir=Path(__file__).resolve().parent/store_dir

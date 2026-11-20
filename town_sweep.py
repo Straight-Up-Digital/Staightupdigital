@@ -529,7 +529,7 @@ def run_sweep(town: str, trades: list[str], max_searches: int, pages: int = 1, o
         for t, s in planned:
             progress(f"   {t} (results {s + 1}-{s + 20})")
         return {"dry_run": True, "planned": len(planned), "would_cost": cost_if_uncached}
-    client = httpx.Client(base_url=None,headers={"User-Agent": "StraightUpDigital-TownSweep/1.0"}, follow_redirects=True)
+    client = httpx.Client(headers={"User-Agent": "StraightUpDigital-TownSweep/1.0"}, follow_redirects=True)
     leads, errors, made, cached = [], [], 0, 0
     if api_key:
         left = searches_left(api_key, client)

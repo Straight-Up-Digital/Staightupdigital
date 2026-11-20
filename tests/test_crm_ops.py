@@ -1,7 +1,9 @@
 import sqlite3
 import tempfile
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import crm
 import crm_ops
@@ -34,8 +36,25 @@ class CrmOpsTests(unittest.TestCase):
         self.assertIn("Example Garden Centre", templates["whatsapp_audit"])
         self.assertIn("Broken mobile menu", templates["email_audit_body"])
 
+    def test_next_action_snooze_complete_reopen_and_history_are_tenant_scoped(self):
+        key = f"followup:{self.contact}:{date.today().isoformat()}"
+        snoozed = crm_ops.set_next_action_state(key, "Synthetic follow-up", "snooze", 7, self.db, "tenant-a")
+        self.assertEqual(snoozed["snoozed_until"], (date.today() + timedelta(days=7)).isoformat())
+        completed = crm_ops.set_next_action_state(key, "Synthetic follow-up", "complete", db_path=self.db, tenant_id="tenant-a")
+        self.assertEqual(completed["status"], "completed")
+        reopened = crm_ops.set_next_action_state(key, "Synthetic follow-up", "reopen", db_path=self.db, tenant_id="tenant-a")
+        self.assertEqual(reopened["status"], "open")
+        history = crm_ops.list_next_action_history(self.db, "tenant-a")
+        self.assertEqual([x["action"] for x in history], ["reopened", "completed", "snoozed"])
+        self.assertEqual(crm_ops.list_next_action_history(self.db, "tenant-b"), [])
+        with self.assertRaisesRegex(ValueError, "1, 3, 7, 14 or 30"):
+            crm_ops.set_next_action_state(key, "Synthetic follow-up", "snooze", 2, self.db, "tenant-a")
+
     def test_invoice_deposit_and_balance_are_reconciled_without_overpayment(self):
         invoice_id = crm_ops.create_invoice(self.contact, "Website fixes", 1000, "2026-12-15", db_path=self.db, tenant_id="tenant-a")
+        self.assertEqual(crm_ops.invoice_details(invoice_id, self.db, "tenant-a")["invoice_number"], "0048")
+        next_id = crm_ops.create_invoice(self.contact, "Follow-up work", 250, "2026-12-20", db_path=self.db, tenant_id="tenant-a")
+        self.assertEqual(crm_ops.invoice_details(next_id, self.db, "tenant-a")["invoice_number"], "0049")
         crm_ops.record_payment(self.contact, 300, "2026-11-15", invoice_id, db_path=self.db, tenant_id="tenant-a")
         self.assertEqual(crm_ops.invoice_details(invoice_id, self.db, "tenant-a")["status"], "part_paid")
         with self.assertRaisesRegex(ValueError, "exceed"):
@@ -63,6 +82,39 @@ class CrmOpsTests(unittest.TestCase):
         monthly = crm_ops.create_monthly_report_pdf(self.contact, "2026-11", self.root / "monthly", self.db, "tenant-a")
         self.assertTrue(monthly.is_file())
         self.assertTrue(monthly.read_bytes().startswith(b"%PDF-"))
+
+    def test_unpaid_invoice_can_be_deleted_but_paid_invoice_is_protected(self):
+        unpaid = crm_ops.create_invoice(self.contact, "Test invoice", 100, "2026-12-15", db_path=self.db, tenant_id="tenant-a")
+        self.assertEqual(crm_ops.delete_invoice(unpaid, self.db, "tenant-a"), self.contact)
+        with self.assertRaisesRegex(LookupError, "Invoice not found"):
+            crm_ops.invoice_details(unpaid, self.db, "tenant-a")
+
+        paid = crm_ops.create_invoice(self.contact, "Paid test invoice", 100, "2026-12-15", db_path=self.db, tenant_id="tenant-a")
+        crm_ops.record_payment(self.contact, 20, "2026-11-18", paid, db_path=self.db, tenant_id="tenant-a")
+        with self.assertRaisesRegex(ValueError, "recorded payments"):
+            crm_ops.delete_invoice(paid, self.db, "tenant-a")
+        self.assertEqual(crm_ops.invoice_details(paid, self.db, "tenant-a")["status"], "part_paid")
+
+    def test_google_maps_sweep_adds_lead_and_repeat_merges_by_place_id(self):
+        import town_sweep
+        lead = town_sweep.lead_from_maps({
+            "title": "Synthetic Google Listing", "type": "plumber", "phone": "+27 46 000 0000",
+            "address": "1 Sample Road, Port Alfred, South Africa", "place_id": "test-place-id-001",
+            "website": "", "rating": 4.5, "reviews": 12,
+            "gps_coordinates": {"latitude": -33.59, "longitude": 26.89},
+        }, "plumber", "Port Alfred")
+        payload = {"town": "Port Alfred", "leads": [lead]}
+
+        first = crm.import_sweep_payload(payload, self.db, "tenant-a")
+        self.assertEqual(first["new_rows"], 1)
+        contact = crm.get_contact(first["ids"][0], self.db, "tenant-a")
+        self.assertEqual(contact["found_via"], "google_maps_serpapi")
+        self.assertEqual(contact["town"], "Port Alfred")
+        self.assertFalse(contact["outreach_allowed"])
+
+        second = crm.import_sweep_payload(payload, self.db, "tenant-a")
+        self.assertEqual(second["new_rows"], 0)
+        self.assertEqual(second["merged_existing"], 1)
 
     def test_website_enquiry_is_idempotent_and_tracked_as_website_source(self):
         fields = {"business_name": "New Website Lead", "email": "lead@example.test", "message": "Please call me", "form_type": "contact", "consentGiven": True, "consentTextVersion": "privacy-2026-11", "consentTimestamp": "2026-11-15T01:00:00Z", "source": "/contact"}
@@ -109,6 +161,30 @@ class CrmOpsTests(unittest.TestCase):
         metrics = crm_ops.sales_metrics(self.db, "tenant-a")
         self.assertEqual(metrics["total"], 1)
         self.assertEqual(metrics["stages"]["new"], 1)
+
+    def test_sales_metrics_do_not_double_count_hosting_in_bundled_retainer(self):
+        with crm.connect(self.db) as conn:
+            conn.execute(
+                """UPDATE contacts SET pipeline_stage='live',monthly_fee=699,
+                   hosting_enabled=1,retainer_name='Active Growth' WHERE id=? AND tenant_id=?""",
+                (self.contact, "tenant-a"),
+            )
+        configured = {
+            "hosting": 129,
+            "retainers": [{"name": "Active Growth", "includes_hosting": True}],
+        }
+        with patch("crm_ops.pricing_from_config", return_value=configured):
+            metrics = crm_ops.sales_metrics(self.db, "tenant-a")
+        self.assertEqual(metrics["monthly_live_zar"], 699)
+
+        with crm.connect(self.db) as conn:
+            conn.execute(
+                "UPDATE contacts SET retainer_name='Custom plan' WHERE id=? AND tenant_id=?",
+                (self.contact, "tenant-a"),
+            )
+        with patch("crm_ops.pricing_from_config", return_value=configured):
+            metrics = crm_ops.sales_metrics(self.db, "tenant-a")
+        self.assertEqual(metrics["monthly_live_zar"], 828)
 
 
 if __name__ == "__main__":

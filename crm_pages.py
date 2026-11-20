@@ -1,12 +1,206 @@
 """Additional operations pages for the local Straight Up Digital CRM."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 
 def _w():
     import crm_web as w
     return w
+
+
+def next_actions_page(message: str = "") -> bytes:
+    """Show existing work that needs attention; this page never changes CRM data."""
+    w = _w()
+    from crm import connect
+
+    tenant = w.tenant_id()
+    today = date.today()
+    today_text = today.isoformat()
+    horizon = (today + timedelta(days=14)).isoformat()
+    stale_before = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="seconds")
+    with connect(w.db_path()) as conn:
+        followups = conn.execute(
+            """SELECT id,business_name,next_follow_up_date FROM contacts
+               WHERE tenant_id=? AND next_follow_up_date<>'' AND next_follow_up_date<=?
+                 AND pipeline_stage NOT IN ('live','lost')
+               ORDER BY next_follow_up_date,id LIMIT 25""",
+            (tenant, today_text),
+        ).fetchall()
+        enquiries = conn.execute(
+            """SELECT e.id AS enquiry_id,e.contact_id,c.business_name,e.form_type,e.received_at
+               FROM crm_website_enquiries e JOIN contacts c
+                 ON c.id=e.contact_id AND c.tenant_id=e.tenant_id
+               WHERE e.tenant_id=? AND NOT EXISTS (
+                 SELECT 1 FROM crm_activities a WHERE a.tenant_id=e.tenant_id
+                   AND a.contact_id=e.contact_id AND a.direction='outbound'
+                   AND a.created_at>=e.received_at)
+               ORDER BY e.received_at LIMIT 25""",
+            (tenant,),
+        ).fetchall()
+        audits = conn.execute(
+            """SELECT j.job_id,j.contact_id,c.business_name,j.status,j.created_at,j.error_log
+               FROM audit_jobs j LEFT JOIN contacts c ON c.id=j.contact_id AND c.tenant_id=j.tenant_id
+               WHERE j.tenant_id=? AND (j.status='failed' OR
+                 (j.status IN ('queued','processing') AND j.created_at<=?))
+               ORDER BY CASE j.status WHEN 'failed' THEN 0 ELSE 1 END,j.created_at LIMIT 25""",
+            (tenant, stale_before),
+        ).fetchall()
+        invoices = conn.execute(
+            """SELECT i.id AS invoice_id,i.contact_id,c.business_name,i.invoice_number,i.due_on,i.amount,
+                      COALESCE(SUM(p.amount),0) AS paid
+               FROM crm_invoices i JOIN contacts c ON c.id=i.contact_id AND c.tenant_id=i.tenant_id
+               LEFT JOIN crm_payments p ON p.invoice_id=i.id AND p.tenant_id=i.tenant_id
+               WHERE i.tenant_id=? AND i.status NOT IN ('paid','void') AND i.due_on<=?
+               GROUP BY i.id HAVING COALESCE(SUM(p.amount),0)<i.amount
+               ORDER BY i.due_on,i.id LIMIT 25""",
+            (tenant, today_text),
+        ).fetchall()
+        renewals = conn.execute(
+            """SELECT r.id AS recurring_id,r.contact_id,c.business_name,r.description,r.item_type,r.amount,r.next_due_on
+               FROM crm_recurring_items r JOIN contacts c ON c.id=r.contact_id AND c.tenant_id=r.tenant_id
+               WHERE r.tenant_id=? AND r.active=1 AND r.next_due_on<>'' AND r.next_due_on<=?
+               ORDER BY r.next_due_on,r.id LIMIT 25""",
+            (tenant, horizon),
+        ).fetchall()
+        milestones = conn.execute(
+            """SELECT p.id AS project_id,p.contact_id,c.business_name,p.next_milestone,p.next_milestone_on,p.status
+               FROM crm_projects p JOIN contacts c ON c.id=p.contact_id AND c.tenant_id=p.tenant_id
+               WHERE p.tenant_id=? AND p.status<>'paused' AND p.next_milestone_on<>''
+                 AND p.next_milestone_on<=?
+               ORDER BY p.next_milestone_on,p.contact_id LIMIT 25""",
+            (tenant, horizon),
+        ).fetchall()
+        task_pairs = []
+        task_pairs.extend((f"followup:{int(r['id'])}:{r['next_follow_up_date']}", r) for r in followups)
+        task_pairs.extend((f"enquiry:{int(r['enquiry_id'])}", r) for r in enquiries)
+        task_pairs.extend((f"audit:{r['job_id']}", r) for r in audits)
+        task_pairs.extend((f"invoice:{int(r['invoice_id'])}:{r['due_on']}", r) for r in invoices)
+        task_pairs.extend((f"renewal:{int(r['recurring_id'])}:{r['next_due_on']}", r) for r in renewals)
+        task_pairs.extend((f"milestone:{int(r['project_id'])}:{r['next_milestone_on']}", r) for r in milestones)
+        keys = [key for key, _row in task_pairs]
+        states = {}
+        if keys:
+            marks = ",".join("?" for _ in keys)
+            states = {r["task_key"]: dict(r) for r in conn.execute(
+                f"SELECT task_key,status,snoozed_until FROM crm_next_action_state WHERE tenant_id=? AND task_key IN ({marks})",
+                [tenant, *keys],
+            ).fetchall()}
+        history = [dict(r) for r in conn.execute(
+            "SELECT task_key,task_title,action,snoozed_until,created_at FROM crm_next_action_history WHERE tenant_id=? ORDER BY id DESC LIMIT 30",
+            (tenant,),
+        ).fetchall()]
+
+    def task_key(kind: str, r) -> str:
+        if kind == "followup":
+            return f"followup:{int(r['id'])}:{r['next_follow_up_date']}"
+        if kind == "enquiry":
+            return f"enquiry:{int(r['enquiry_id'])}"
+        if kind == "audit":
+            return f"audit:{r['job_id']}"
+        if kind == "invoice":
+            return f"invoice:{int(r['invoice_id'])}:{r['due_on']}"
+        if kind == "renewal":
+            return f"renewal:{int(r['recurring_id'])}:{r['next_due_on']}"
+        return f"milestone:{int(r['project_id'])}:{r['next_milestone_on']}"
+
+    def visible(rows, kind: str):
+        return [r for r in rows if not (
+            states.get(task_key(kind, r), {}).get("status") == "completed" or
+            states.get(task_key(kind, r), {}).get("snoozed_until", "") > today_text
+        )]
+
+    followups = visible(followups, "followup")
+    enquiries = visible(enquiries, "enquiry")
+    audits = visible(audits, "audit")
+    invoices = visible(invoices, "invoice")
+    renewals = visible(renewals, "renewal")
+    milestones = visible(milestones, "milestone")
+
+    def row(title: str, detail: str, href: str, key: str, action: str = "Open") -> str:
+        safe_title, safe_key = w.h(title), w.h(key)
+        controls = (f'<div class="actions"><a class="btn sm" href="{w.h(href)}">{w.h(action)}</a>'
+                    f'<form method="post" action="/next-actions/action" class="next-action-form">'
+                    f'<input type="hidden" name="task_key" value="{safe_key}"><input type="hidden" name="task_title" value="{safe_title}">'
+                    f'<button class="btn sm" name="action" value="complete" aria-label="Complete reminder: {safe_title}">Complete</button>'
+                    f'<select id="snooze-{safe_key}" name="snooze_days" aria-label="Snooze duration"><option value="1">1 day</option><option value="3">3 days</option>'
+                    f'<option value="7" selected>7 days</option><option value="14">14 days</option><option value="30">30 days</option></select>'
+                    f'<button class="btn sm" name="action" value="snooze">Snooze</button></form></div>')
+        return (f'<div class="today-row"><div><b>{safe_title}</b><div class="muted small">{w.h(detail)}</div></div>'
+                f'{controls}</div>')
+
+    def section(title: str, entries: list[str], empty: str) -> str:
+        content = "".join(entries) or f'<div class="empty">{empty}</div>'
+        return f'<section class="panel"><div class="panel-head"><h2>{title}</h2><span>{len(entries)} shown</span></div>{content}</section>'
+
+    follow_rows = []
+    for r in followups:
+        due = str(r["next_follow_up_date"])
+        label = "Due today" if due == today_text else f"Overdue since {due}"
+        follow_rows.append(row(str(r["business_name"]), label, f'/contact/{int(r["id"])}', task_key("followup", r)))
+
+    enquiry_rows = []
+    for r in enquiries:
+        received = str(r["received_at"] or "")[:16].replace("T", " ")
+        form_type = str(r["form_type"] or "website enquiry").replace("_", " ")
+        enquiry_rows.append(row(str(r["business_name"]), f'{form_type} · Received {received}',
+                                f'/contact/{int(r["contact_id"])}', task_key("enquiry", r), "Review"))
+
+    audit_rows = []
+    for r in audits:
+        label = "Failed audit — review and retry if appropriate" if r["status"] == "failed" else "Queued/processing for over 24 hours — check queue"
+        audit_rows.append(row(str(r["business_name"] or "Removed lead"), f'{label} · {str(r["created_at"])[:16]}',
+                              "/queue", task_key("audit", r), "Open queue"))
+
+    invoice_rows = []
+    for r in invoices:
+        balance = max(0.0, float(r["amount"] or 0) - float(r["paid"] or 0))
+        due = str(r["due_on"] or "")
+        label = "Due today" if due == today_text else f"Overdue since {w.h(due)}"
+        invoice_rows.append(row(str(r["business_name"]),
+                                f'Invoice {r["invoice_number"]} · Balance {w.money(balance)} · {label}',
+                                f'/contact/{int(r["contact_id"])}', task_key("invoice", r), "Review"))
+
+    renewal_rows = []
+    for r in renewals:
+        title = str(r["business_name"])
+        item = str(r["description"] or r["item_type"])
+        renewal_rows.append(row(title, f'{item} · {w.money(r["amount"])} · Due {r["next_due_on"]}',
+                                f'/contact/{int(r["contact_id"])}', task_key("renewal", r), "Review"))
+
+    milestone_rows = []
+    for r in milestones:
+        milestone_rows.append(row(str(r["business_name"]),
+                                  f'{r["next_milestone"] or "Project milestone"} · Due {r["next_milestone_on"]}',
+                                  f'/contact/{int(r["contact_id"])}', task_key("milestone", r), "Open project"))
+
+    total = sum(map(len, (follow_rows, enquiry_rows, audit_rows, invoice_rows, renewal_rows, milestone_rows)))
+    history_rows = []
+    for event in history:
+        action_text = ("Completed reminder" if event["action"] == "completed" else
+                       "Reopened reminder" if event["action"] == "reopened" else
+                       f'Snoozed until {event["snoozed_until"]}')
+        created = str(event["created_at"] or "")[:16].replace("T", " ")
+        undo = ""
+        if event["action"] in ("completed", "snoozed"):
+            undo = (f'<form method="post" action="/next-actions/action"><input type="hidden" name="task_key" value="{w.h(event["task_key"])}">'
+                    f'<input type="hidden" name="task_title" value="{w.h(event["task_title"])}">'
+                    f'<button class="btn sm" name="action" value="reopen">Reopen reminder</button></form>')
+        history_rows.append(f'<div class="today-row"><div><b>{w.h(event["task_title"])}</b>'
+                            f'<div class="muted small">{w.h(action_text)} · {w.h(created)}</div></div>{undo}</div>')
+    history_panel = (f'<section class="panel"><div class="panel-head"><h2>Recent action history</h2><span>{len(history_rows)} shown</span></div>'
+                     + ("".join(history_rows) or '<div class="empty">No completed or snoozed reminders yet.</div>') + '</section>')
+    body = f'''<div class="head"><div><h1>Next actions</h1><p>One place for follow-ups and operational items that need your review. No messages, payments, retries or record changes happen automatically here.</p></div><a class="btn" href="/">Back to Leads</a></div>
+<div class="kpis"><div class="kpi"><div><div class="lab">Items shown</div><div class="num">{total}</div><div class="sub">Up to 25 per category; open linked workflows for more</div></div></div></div>
+{section("Website enquiries awaiting a logged follow-up", enquiry_rows, "No website enquiries are waiting for a logged outbound follow-up.")}
+{section("Lead follow-ups due", follow_rows, "No dated lead follow-ups are due today or overdue.")}
+{section("Audit jobs needing attention", audit_rows, "No failed or stale audit jobs.")}
+{section("Overdue or due invoices", invoice_rows, "No unpaid invoices are past their due date.")}
+{section("Renewals due within 14 days", renewal_rows, "No tracked recurring items are due within 14 days.")}
+{section("Project milestones due within 14 days", milestone_rows, "No project milestones are due within 14 days.")}
+{history_panel}
+<p class="note">Completing or snoozing dismisses only this reminder; it does not mark an invoice paid, change a project, send a message, or retry an audit.</p>'''
+    return w.layout("Next actions", body, "today", message)
 
 
 def audit_queue_page(message: str = "") -> bytes:
@@ -48,7 +242,7 @@ def projects_page(message: str = "") -> bytes:
     from crm import connect
     with connect(w.db_path()) as conn:
         rows = conn.execute("SELECT c.id,c.business_name,c.town,p.status,p.domain,p.next_milestone,p.next_milestone_on,p.go_live_on FROM contacts c LEFT JOIN crm_projects p ON p.contact_id=c.id AND p.tenant_id=c.tenant_id WHERE c.tenant_id=? AND (p.id IS NOT NULL OR c.pipeline_stage='live') ORDER BY COALESCE(p.next_milestone_on,'9999-12-31')", (w.tenant_id(),)).fetchall()
-    trs = "".join(f'<tr><td><a href="/contact/{r["id"]}">{w.h(r["business_name"])}</a></td><td>{w.h(r["town"])}</td><td>{w.h((r["status"] or "live").replace("_"," ").title())}</td><td>{w.h(r["domain"] or "—")}</td><td>{w.h(r["next_milestone"] or "—")}</td><td>{w.h(r["next_milestone_on"] or "—")}</td><td>{w.h(r["go_live_on"] or "—")}</td></tr>' for r in rows) or '<tr><td colspan="7">No projects tracked yet. Save project details from a client profile.</td></tr>'
+    trs = "".join(f'<tr><td><a href="/contact/{r["id"]}">{w.h(r["business_name"])}</a></td><td>{w.h(r["town"])}</td><td>{w.h((r["status"] or "live").replace("_"," ").title())}</td><td>{w.h(r["domain"] or "-")}</td><td>{w.h(r["next_milestone"] or "-")}</td><td>{w.h(r["next_milestone_on"] or "-")}</td><td>{w.h(r["go_live_on"] or "-")}</td></tr>' for r in rows) or '<tr><td colspan="7">No projects tracked yet. Save project details from a client profile.</td></tr>'
     body = f'''<div class="head"><div><h1>Client projects</h1><p>Website delivery status, milestones, domain/hosting notes and go-live dates.</p></div></div><section class="panel"><div class="tbl-wrap"><table style="min-width:760px"><thead><tr><th>Client</th><th>Town</th><th>Status</th><th>Domain</th><th>Next milestone</th><th>Due</th><th>Live since</th></tr></thead><tbody>{trs}</tbody></table></div></section>'''
     return w.layout("Projects", body, "projects", message)
 
@@ -77,7 +271,7 @@ def bulk_page(message: str = "") -> bytes:
     w = _w()
     from crm import list_contacts
     leads = list_contacts(w.db_path(), tenant_id=w.tenant_id(), limit=250)
-    rows = "".join(f'<tr><td><input type="checkbox" name="contact_id" value="{c["id"]}"></td><td><a href="/contact/{c["id"]}">{w.h(c["business_name"])}</a></td><td>{w.h(c.get("town"))}</td><td>{w.stage_pill(c.get("pipeline_stage"))}</td><td>{w.h(c.get("website_url") or "—")}</td></tr>' for c in leads)
+    rows = "".join(f'<tr><td><input type="checkbox" name="contact_id" value="{c["id"]}"></td><td><a href="/contact/{c["id"]}">{w.h(c["business_name"])}</a></td><td>{w.h(c.get("town"))}</td><td>{w.stage_pill(c.get("pipeline_stage"))}</td><td>{w.h(c.get("website_url") or "-")}</td></tr>' for c in leads)
     stage_opts = "".join(f'<option value="{s}">{w.h(w.STAGE_LABEL[s])}</option>' for s in w.LEAD_STAGES)
     body = f'''<div class="head"><div><h1>Bulk lead actions</h1><p>Select up to 250 leads for a stage change. Confirm before saving.</p></div></div><section class="panel"><form method="post" action="/bulk/stage"><div class="tbl-wrap"><table style="min-width:650px"><thead><tr><th>Select</th><th>Business</th><th>Town</th><th>Stage</th><th>Website</th></tr></thead><tbody>{rows or '<tr><td colspan="5">No leads</td></tr>'}</tbody></table></div><div class="filters" style="margin-top:12px"><select name="stage">{stage_opts}</select><label><input type="checkbox" name="confirm" value="yes" required> I reviewed these leads</label><button class="btn primary">Change selected stage</button></div></form></section>
 <section class="panel"><h2>CSV import with duplicate review</h2><p class="note">Choose a local CSV file or paste its contents. Preview and classify each row before import. Existing contact values are never silently overwritten.</p><form method="post" action="/bulk/csv-preview"><label class="lab" for="csv-file">Choose CSV file (optional; maximum 250 KB)</label><input id="csv-file" data-csv-file type="file" accept=".csv,text/csv"><textarea id="csv-text" name="csv_text" required maxlength="250000" rows="8" placeholder="business_name,email,phone,website_url,town,sector&#10;Example Business,owner@example.co.za,0460000000,https://example.co.za,Port Alfred,Hospitality"></textarea><button class="btn">Preview CSV</button></form></section>
@@ -118,7 +312,7 @@ def csv_preview_page(rows: list[dict], token: str, message: str = "") -> bytes:
         else:
             options.append('<option value="new">Import as new lead (unverified)</option>')
             choice = "new"
-        summary = " · ".join(w.h(d.get(k) or "—") for k in ("business_name", "email", "phone", "website_url", "town", "sector"))
+        summary = " · ".join(w.h(d.get(k) or "-") for k in ("business_name", "email", "phone", "website_url", "town", "sector"))
         lines.append(f'<tr><td>{item["row"] + 1}</td><td>{summary}</td><td><select name="action_{item["row"]}">{"".join(options)}</select></td></tr>')
     body = f'''<div class="head"><div><h1>Review CSV rows</h1><p>Choose skip, import as a new unverified lead, or fill blank fields on a matched lead. No existing value is overwritten.</p></div><a class="btn" href="/bulk">Cancel</a></div>
 <section class="panel"><form method="post" action="/bulk/csv-commit"><input type="hidden" name="token" value="{w.h(token)}"><div class="tbl-wrap"><table style="min-width:920px"><thead><tr><th>Row</th><th>CSV details</th><th>What should happen?</th></tr></thead><tbody>{''.join(lines)}</tbody></table></div><label style="display:block;margin:14px 0"><input type="checkbox" name="confirm" value="yes" required> I reviewed every row and confirm the selected changes</label><button class="btn primary">Apply reviewed import</button></form></section>'''

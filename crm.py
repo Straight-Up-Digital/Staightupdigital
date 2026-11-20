@@ -8,6 +8,7 @@ import argparse
 import csv
 import json
 import re
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -198,6 +199,25 @@ CREATE TABLE IF NOT EXISTS crm_website_enquiries (
     UNIQUE(tenant_id, external_id)
 );
 CREATE INDEX IF NOT EXISTS idx_crm_enquiries_received ON crm_website_enquiries(tenant_id, received_at DESC);
+CREATE TABLE IF NOT EXISTS crm_next_action_state (
+    tenant_id TEXT NOT NULL,
+    task_key TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','completed')),
+    snoozed_until TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(tenant_id, task_key)
+);
+CREATE TABLE IF NOT EXISTS crm_next_action_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id TEXT NOT NULL,
+    task_key TEXT NOT NULL,
+    task_title TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('completed','snoozed','reopened')),
+    snoozed_until TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_crm_next_action_history_tenant_date
+    ON crm_next_action_history(tenant_id, created_at DESC);
 """
 
 class ClosingConnection(sqlite3.Connection):
@@ -441,6 +461,29 @@ def _derive_town(address: str, towns_found: list[str] | None = None, fallback: s
     # A contradictory explicit locality in the address is kept as other for review.
     if "cape town" in address_text and "port alfred" in address_text:
         return "other"
+    for town in ("Port Alfred", "Kenton-on-Sea", "Bathurst", "Alexandria"):
+        if town.casefold() in address_text:
+            return town
+    found_text = " ".join(towns_found or []).casefold()
+    for town in ("Port Alfred", "Kenton-on-Sea", "Bathurst", "Alexandria"):
+        if town.casefold() in found_text:
+            return town
+    fallback_clean = re.sub(r"\s+", " ", str(fallback or "")).strip()
+    # The town that was searched is the most consistent label, as long as the address agrees with it.
+    if fallback_clean and fallback_clean.casefold() in address_text:
+        return fallback_clean.title()
+    # Otherwise read the town from a South African address: "Street, Suburb, Town, 6170, South Africa".
+    parts = [p.strip() for p in str(address or "").split(",") if p.strip()]
+    parts = [p for p in parts if p.casefold() not in ("south africa", "za")]
+    for i, part in enumerate(parts):
+        m = re.match(r"^(.*?)\s*\b\d{4}\b$", part)
+        if m:
+            name = m.group(1).strip() or (parts[i - 1].strip() if i > 0 else "")
+            if name and not re.search(r"\d", name) and len(name) <= 40:
+                return name.title()
+    if fallback_clean and len(fallback_clean) <= 40 and not re.search(r"\d", fallback_clean):
+        return fallback_clean.title()
+    return "other"
     for town in ("Port Alfred", "Kenton-on-Sea", "Bathurst", "Alexandria"):
         if town.casefold() in address_text:
             return town

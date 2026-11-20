@@ -5,11 +5,18 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlencode
 from unittest.mock import patch
 
 import crm
+import crm_tools
 import crm_web
 from security_schema import migrate
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        return None
 
 
 class PdfTenantIsolationTests(unittest.TestCase):
@@ -54,6 +61,8 @@ class PdfTenantIsolationTests(unittest.TestCase):
             patch.object(crm_web, "db_path", return_value=self.db_path),
             patch.object(crm_web, "tenant_id", return_value="tenant-a"),
             patch.object(crm_web, "PROJECT_DIR", self.root),
+            patch.object(crm_tools, "_password", return_value="test-password"),
+            patch.object(crm_tools, "_check_password", return_value=True),
         )
         for patcher in patchers:
             patcher.start()
@@ -63,6 +72,30 @@ class PdfTenantIsolationTests(unittest.TestCase):
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.server_thread.start()
         self.addCleanup(self._close_server)
+        self.session_cookie = self._login()
+
+    def _login(self):
+        base_url = f"http://127.0.0.1:{self.server.server_port}"
+        request = urllib.request.Request(
+            f"{base_url}/login",
+            data=urlencode({"password": "test-password"}).encode("utf-8"),
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": base_url,
+            },
+        )
+        opener = urllib.request.build_opener(_NoRedirect())
+        try:
+            response = opener.open(request)
+        except urllib.error.HTTPError as error:
+            response = error
+        try:
+            self.assertEqual(response.code, 303)
+            cookie = response.headers.get("Set-Cookie", "")
+            self.assertTrue(cookie.startswith("sud_session="))
+            return cookie.split(";", 1)[0]
+        finally:
+            response.close()
 
     def _close_server(self):
         self.server.shutdown()
@@ -72,7 +105,10 @@ class PdfTenantIsolationTests(unittest.TestCase):
     def _get_pdf(self, history_id):
         url = f"http://127.0.0.1:{self.server.server_port}/pdf/{history_id}"
         try:
-            with urllib.request.urlopen(url) as response:
+            request = urllib.request.Request(
+                url, headers={"Cookie": self.session_cookie}
+            )
+            with urllib.request.urlopen(request) as response:
                 return response.status, response.read()
         except urllib.error.HTTPError as error:
             try:
