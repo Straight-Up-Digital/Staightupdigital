@@ -1,5 +1,7 @@
 # Straight Up Digital website — developer handover
 
+> **Historical snapshot:** This handover describes the state observed on 16 November 2026. Since then, the website Worker has been deployed to `workers.dev`; the current Cloudflare and CRM status is recorded in the newer migration/setup notes. The Python CRM is still local and must not be presented as the completed Cloudflare CRM.
+
 **Prepared:** 16 November 2026 (South Africa time)
 **Scope:** website repository, Cloudflare migration, legacy Netlify path, and launch blockers. This handover is a local file outside the website repository. No source changes, merge, push, build, or deployment were made for this handover.
 

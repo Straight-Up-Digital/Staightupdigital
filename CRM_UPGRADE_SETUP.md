@@ -1,5 +1,7 @@
 # Straight Up Digital CRM upgrade: final setup
 
+> **Current status — 20 November 2026:** The public website is deployed to Cloudflare Workers at `https://straight-up-digital-cloudflare.stjohn-toperformer.workers.dev`; the Python/SQLite CRM is still local and is not the requested cloud CRM. The Worker uses Firestore, has no D1 binding, and keeps online report publishing disabled. The Netlify/local-sync instructions below are historical and are not the current target architecture. Do not expose the CRM or move client records until Cloudflare persistence and owner authentication are in place. Paystack checkout is not implemented. Local databases and backup files must remain out of Git.
+
 ## What is already implemented
 
 The local CRM now includes the requested activity timeline and draft messages; quote, invoice, payment and renewal tracking; project status; audit queue/retry and bounded town batches; duplicate-reviewed CSV import; score history and monthly reporting; local backups; source/consent/opt-out tracking; guarded erasure; and owner-clicked website-enquiry sync. The Python CRM remains bound to `127.0.0.1`; do not expose it through a tunnel.

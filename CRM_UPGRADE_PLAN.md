@@ -1,5 +1,7 @@
 # Straight Up Digital CRM upgrade
 
+> **Scope update — 20 November 2026:** This plan describes local SQLite CRM enhancements that are implemented in the legacy app. The owner has since specified that the CRM and related services must be accessible online through Cloudflare, with no local hosting. That cloud migration is not complete. Keep the local-only guardrails below; do not treat this plan's completion notes as completion of the Cloudflare CRM, audit-report, or payment requirements.
+
 ## Scope and safeguards
 
 Build the requested eight upgrades into the existing private Python/SQLite CRM and its existing branded UI. Preserve current local edits in `crm_web.py`, `business_auditor.py`, and `audit_queue.py`; never overwrite the user's work. Keep the CRM and client records private and bound to `127.0.0.1`. Do not expose the CRM through a tunnel or deploy the Python CRM/database to Netlify. Netlify is only the public website/enquiry edge; payments remain manual and tracked, not processed. All database changes must be additive/migratory, tenant-scoped, and tested using temporary databases/synthetic records. Do not print existing client data.
