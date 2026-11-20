@@ -25,6 +25,12 @@ backups/
 /.manus-*.tmp
 /auditor_config.json
 /status_report.txt
+/crm.db
+/crm_dump.json
+/crm_files*.zip
+/for_claude.zip
+/file_dates.txt
+/backup_*/
 
 # Local editor settings and source backups
 /.vscode/
